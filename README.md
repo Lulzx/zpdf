@@ -59,10 +59,10 @@ Text extraction accuracy vs MuPDF (reference) on US Constitution (85 pages):
 | Tika | 97.4% | 10.6% | 1,307 ms | 24x slower |
 | pdftotext | 57.0% | 19.8% | 90 ms | 1.7x slower |
 
-- **Char Accuracy**: Sequence similarity (higher = better)
-- **WER**: Word Error Rate (lower = better)
+- **Char Accuracy**: Sequence similarity vs MuPDF baseline (higher = better)
+- **WER**: Word Error Rate vs MuPDF baseline (lower = better)
 
-zpdf is 650x faster than Tika with better accuracy.
+MuPDF is the accuracy baseline (100%). zpdf is 650x faster than Tika with better accuracy.
 
 Run `PYTHONPATH=python python benchmark/accuracy.py` to reproduce.
 
