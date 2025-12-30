@@ -138,17 +138,32 @@ python/zpdf/         # Python bindings (cffi)
 examples/            # Usage examples
 ```
 
-## Status
+## Comparison with MuPDF
 
-Implemented:
-- XRef table and stream parsing
-- Incremental PDF updates (follows /Prev chain for modified documents)
-- Object parser
-- Page tree resolution
-- Content stream interpretation (Tj, TJ, Tm, Td, etc.)
-- Font encoding (WinAnsi, MacRoman, ToUnicode CMap)
-- CID font handling (Type0 composite fonts, Identity-H/V encoding, UTF-16BE)
-- Stream decompression (FlateDecode, ASCII85, ASCIIHex, LZW, RunLength)
+| Feature | zpdf | MuPDF |
+|---------|------|-------|
+| **Text Extraction** | | |
+| Reading order / layout analysis | No | Yes |
+| Two-column detection | No | Yes |
+| Paragraph grouping | No | Yes |
+| Word/line bounding boxes | No | Yes |
+| **Font Support** | | |
+| WinAnsi/MacRoman | Yes | Yes |
+| ToUnicode CMap | Yes | Yes |
+| CID fonts (Type0) | Partial | Full |
+| Embedded fonts | No | Yes |
+| **Compression** | | |
+| FlateDecode, LZW, ASCII85/Hex | Yes | Yes |
+| JBIG2, JPEG2000 | No | Yes |
+| **PDF Features** | | |
+| Incremental updates | Yes | Yes |
+| Encrypted PDFs | No | Yes |
+| Forms / Annotations | No | Yes |
+| Rendering | No | Yes |
+
+**Use zpdf when:** Speed matters, simple layouts, batch processing raw text.
+
+**Use MuPDF when:** Complex layouts, encrypted PDFs, accurate reading order needed.
 
 ## License
 
