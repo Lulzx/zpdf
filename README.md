@@ -13,12 +13,12 @@ A PDF text extraction library written in Zig.
 
 ## Benchmark
 
-Tested on US Constitution PDF (85 pages, 3.8MB):
+Release build (`-Doptimize=ReleaseFast`) vs MuPDF 1.26:
 
-| Tool | Time | Pages/sec |
-|------|------|-----------|
-| zpdf | 58 ms | 1,466 |
-| MuPDF (mutool convert) | 68 ms | 1,250 |
+| Document | Pages | zpdf | mutool | Speedup |
+|----------|-------|------|--------|---------|
+| Adobe Acrobat Reference (19MB) | 651 | 116 ms | 474 ms | **4.1x** |
+| Pandas Manual (15MB) | 3,743 | 396 ms | 1,095 ms | **2.8x** |
 
 ## Requirements
 
