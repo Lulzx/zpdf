@@ -34,7 +34,7 @@ Peak throughput: **17,620 pages/sec** (Pandas, parallel)
 
 Build with `zig build -Doptimize=ReleaseFast` for these results.
 
-*Note: MuPDF's C library supports multi-threading, but the Homebrew CLI build (`mutool`) has it disabled. Comparison uses the default Homebrew mutool.*
+*Note: MuPDF's threading (`-T` flag) is for rendering/rasterization only. Text extraction via `mutool convert -F text` is single-threaded by design. zpdf parallelizes text extraction across pages.*
 
 ## Requirements
 
