@@ -13,6 +13,8 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 const decompress = @import("decompress.zig");
+const cff = @import("cff.zig");
+const agl = @import("agl.zig");
 
 const Object = parser.Object;
 
@@ -175,6 +177,10 @@ pub const FontEncoding = struct {
     cid_system_info: CIDSystemInfo,
     /// CID to GID mapping (for CIDFontType2)
     cid_to_gid_map: CIDToGIDMap,
+    /// CFF Parser for Type1/Type1C/CIDFontType0C
+    cff_parser: ?cff.CffParser = null,
+    /// Underlying CFF data (owned)
+    cff_data: ?[]const u8 = null,
 
     allocator: std.mem.Allocator,
 
@@ -213,6 +219,12 @@ pub const FontEncoding = struct {
         switch (self.cid_to_gid_map.mapping) {
             .stream_map => |map| self.allocator.free(map),
             .identity => {},
+        }
+        if (self.cff_parser) |*parser_inst| {
+            parser_inst.deinit();
+        }
+        if (self.cff_data) |data| {
+            self.allocator.free(data);
         }
     }
 
@@ -255,6 +267,18 @@ pub const FontEncoding = struct {
 
             // Look up in CMap ranges first
             var codepoint = self.lookupCMap(code.value);
+
+            // If no CMap mapping, try CFF lookup if available
+            if (codepoint == null) {
+                if (self.cff_parser) |*cff_p| {
+                    const gid = @as(u16, @intCast(code.value & 0xFFFF));
+                    if (cff_p.getGlyphName(gid)) |name| {
+                        if (agl.glyphNameToUnicode(name)) |u| {
+                            codepoint = u;
+                        }
+                    }
+                }
+            }
 
             // If no CMap mapping, try Identity interpretation
             if (codepoint == null) {
@@ -342,7 +366,8 @@ pub const FontEncoding = struct {
 pub fn parseFontEncoding(
     allocator: std.mem.Allocator,
     font_dict: Object.Dict,
-    resolve_fn: *const fn (Object) Object,
+    resolve_fn: *const fn (ctx: *const anyopaque, Object) Object,
+    resolve_ctx: *const anyopaque,
 ) !FontEncoding {
     var encoding = FontEncoding.init(allocator);
 
@@ -357,7 +382,7 @@ pub fn parseFontEncoding(
 
         // Parse CMap encoding for Type0 fonts
         if (font_dict.get("Encoding")) |enc_obj| {
-            const resolved = resolve_fn(enc_obj);
+            const resolved = resolve_fn(resolve_ctx, enc_obj);
             switch (resolved) {
                 .name => |name| applyPredefinedCMap(&encoding, name),
                 .stream => |stream| {
@@ -371,26 +396,26 @@ pub fn parseFontEncoding(
         // Get CIDFont from DescendantFonts array
         if (font_dict.getArray("DescendantFonts")) |descendants| {
             if (descendants.len > 0) {
-                const cid_font_obj = resolve_fn(descendants[0]);
+                const cid_font_obj = resolve_fn(resolve_ctx, descendants[0]);
                 if (cid_font_obj == .dict) {
                     const cid_font = cid_font_obj.dict;
 
                     // Parse CIDSystemInfo
-                    parseCIDSystemInfo(cid_font, resolve_fn, &encoding);
+                    parseCIDSystemInfo(cid_font, resolve_fn, resolve_ctx, &encoding);
 
                     // Check CIDFont subtype for additional info
                     const cid_subtype = cid_font.getName("Subtype");
                     if (cid_subtype) |cst| {
                         if (std.mem.eql(u8, cst, "CIDFontType2")) {
                             // TrueType-based CID font - parse CIDToGIDMap
-                            try parseCIDToGIDMap(allocator, cid_font, resolve_fn, &encoding);
+                            try parseCIDToGIDMap(allocator, cid_font, resolve_fn, resolve_ctx, &encoding);
                         }
                     }
 
                     // Check for ToUnicode in CIDFont (rare but possible)
                     if (encoding.cmap_ranges.len == 0) {
                         if (cid_font.get("ToUnicode")) |tounicode| {
-                            const tu_resolved = resolve_fn(tounicode);
+                            const tu_resolved = resolve_fn(resolve_ctx, tounicode);
                             if (tu_resolved == .stream) {
                                 try parseToUnicodeCMap(allocator, tu_resolved.stream, &encoding);
                             }
@@ -403,7 +428,7 @@ pub fn parseFontEncoding(
 
     // Check for ToUnicode CMap (highest priority for all fonts)
     if (font_dict.get("ToUnicode")) |tounicode| {
-        const resolved = resolve_fn(tounicode);
+        const resolved = resolve_fn(resolve_ctx, tounicode);
         if (resolved == .stream) {
             try parseToUnicodeCMap(allocator, resolved.stream, &encoding);
             return encoding;
@@ -413,7 +438,7 @@ pub fn parseFontEncoding(
     // For non-Type0 fonts, check standard Encoding
     if (!is_type0) {
         if (font_dict.get("Encoding")) |enc| {
-            const resolved = resolve_fn(enc);
+            const resolved = resolve_fn(resolve_ctx, enc);
 
             switch (resolved) {
                 .name => |name| {
@@ -445,19 +470,19 @@ pub fn parseFontEncoding(
     }
 
     // Parse FontDescriptor for metrics
-    try parseFontDescriptor(font_dict, resolve_fn, &encoding);
+    try parseFontDescriptor(font_dict, resolve_fn, resolve_ctx, &encoding);
 
     // Parse glyph widths
-    try parseWidths(allocator, font_dict, resolve_fn, &encoding);
+    try parseWidths(allocator, font_dict, resolve_fn, resolve_ctx, &encoding);
 
     // For Type0 fonts, also check DescendantFonts for widths
     if (is_type0) {
         if (font_dict.getArray("DescendantFonts")) |descendants| {
             if (descendants.len > 0) {
-                const cid_font_obj = resolve_fn(descendants[0]);
+                const cid_font_obj = resolve_fn(resolve_ctx, descendants[0]);
                 if (cid_font_obj == .dict) {
-                    try parseCIDWidths(allocator, cid_font_obj.dict, resolve_fn, &encoding);
-                    try parseFontDescriptor(cid_font_obj.dict, resolve_fn, &encoding);
+                    try parseCIDWidths(allocator, cid_font_obj.dict, resolve_fn, resolve_ctx, &encoding);
+                    try parseFontDescriptor(cid_font_obj.dict, resolve_fn, resolve_ctx, &encoding);
                 }
             }
         }
@@ -467,9 +492,9 @@ pub fn parseFontEncoding(
 }
 
 /// Parse FontDescriptor for font metrics
-fn parseFontDescriptor(font_dict: Object.Dict, resolve_fn: anytype, encoding: *FontEncoding) !void {
+fn parseFontDescriptor(font_dict: Object.Dict, resolve_fn: *const fn (ctx: *const anyopaque, Object) Object, resolve_ctx: *const anyopaque, encoding: *FontEncoding) !void {
     const fd_obj = font_dict.get("FontDescriptor") orelse return;
-    const resolved = resolve_fn(fd_obj);
+    const resolved = resolve_fn(resolve_ctx, fd_obj);
     if (resolved != .dict) return;
 
     const fd = resolved.dict;
@@ -492,11 +517,42 @@ fn parseFontDescriptor(font_dict: Object.Dict, resolve_fn: anytype, encoding: *F
             }
         }
     }
+
+    // Parse FontFile3 (CFF)
+    if (fd.get("FontFile3")) |ff3_obj| {
+        const resolved_ff3 = resolve_fn(resolve_ctx, ff3_obj);
+        if (resolved_ff3 == .stream) {
+            const stream = resolved_ff3.stream;
+            const subtype = stream.dict.getName("Subtype");
+            // Check if it's CFF (Type1C or CIDFontType0C)
+            if (subtype) |st| {
+                if (std.mem.eql(u8, st, "Type1C") or std.mem.eql(u8, st, "CIDFontType0C")) {
+                    const data = decompress.decompressStream(
+                        encoding.allocator,
+                        stream.data,
+                        stream.dict.get("Filter"),
+                        stream.dict.get("DecodeParms"),
+                    ) catch null;
+                    
+                    if (data) |d| {
+                        encoding.cff_data = d;
+                        if (cff.CffParser.init(encoding.allocator, d)) |parser_inst| {
+                            encoding.cff_parser = parser_inst;
+                        } else |_| {
+                            // If parsing fails, we still own the data so keep cff_data set to free it later
+                            // but cff_parser remains null
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Parse /Widths array for simple fonts
-fn parseWidths(allocator: std.mem.Allocator, font_dict: Object.Dict, resolve_fn: anytype, encoding: *FontEncoding) !void {
+fn parseWidths(allocator: std.mem.Allocator, font_dict: Object.Dict, resolve_fn: *const fn (ctx: *const anyopaque, Object) Object, resolve_ctx: *const anyopaque, encoding: *FontEncoding) !void {
     _ = allocator;
+    _ = resolve_ctx;
     _ = resolve_fn;
 
     // Get FirstChar and LastChar
@@ -526,7 +582,8 @@ fn parseWidths(allocator: std.mem.Allocator, font_dict: Object.Dict, resolve_fn:
 }
 
 /// Parse /W and /DW for CID fonts
-fn parseCIDWidths(allocator: std.mem.Allocator, cid_font: Object.Dict, resolve_fn: anytype, encoding: *FontEncoding) !void {
+fn parseCIDWidths(allocator: std.mem.Allocator, cid_font: Object.Dict, resolve_fn: *const fn (ctx: *const anyopaque, Object) Object, resolve_ctx: *const anyopaque, encoding: *FontEncoding) !void {
+    _ = resolve_ctx;
     _ = resolve_fn;
 
     // Default width
@@ -598,9 +655,9 @@ fn parseCIDWidths(allocator: std.mem.Allocator, cid_font: Object.Dict, resolve_f
 }
 
 /// Parse CIDSystemInfo from CIDFont dictionary
-fn parseCIDSystemInfo(cid_font: Object.Dict, resolve_fn: anytype, encoding: *FontEncoding) void {
+fn parseCIDSystemInfo(cid_font: Object.Dict, resolve_fn: *const fn (ctx: *const anyopaque, Object) Object, resolve_ctx: *const anyopaque, encoding: *FontEncoding) void {
     const csi_obj = cid_font.get("CIDSystemInfo") orelse return;
-    const resolved = resolve_fn(csi_obj);
+    const resolved = resolve_fn(resolve_ctx, csi_obj);
     if (resolved != .dict) return;
 
     const csi = resolved.dict;
@@ -617,9 +674,9 @@ fn parseCIDSystemInfo(cid_font: Object.Dict, resolve_fn: anytype, encoding: *Fon
 }
 
 /// Parse CIDToGIDMap from CIDFont dictionary
-fn parseCIDToGIDMap(allocator: std.mem.Allocator, cid_font: Object.Dict, resolve_fn: anytype, encoding: *FontEncoding) !void {
+fn parseCIDToGIDMap(allocator: std.mem.Allocator, cid_font: Object.Dict, resolve_fn: *const fn (ctx: *const anyopaque, Object) Object, resolve_ctx: *const anyopaque, encoding: *FontEncoding) !void {
     const map_obj = cid_font.get("CIDToGIDMap") orelse return;
-    const resolved = resolve_fn(map_obj);
+    const resolved = resolve_fn(resolve_ctx, map_obj);
 
     switch (resolved) {
         .name => |name| {
@@ -798,7 +855,7 @@ fn parseBfChar(allocator: std.mem.Allocator, data: []const u8, pos: *usize, rang
         const dst = parseHexToken(data, pos) orelse continue;
 
         // For simple 1-byte codes, update the direct map
-        if (src <= 255) {
+        if (src <= 255 and dst <= 0x10FFFF) {
             encoding.codepoint_map[@intCast(src)] = @intCast(dst);
         }
 
@@ -904,135 +961,9 @@ fn isWhitespace(c: u8) bool {
 
 /// Map glyph name to Unicode (common subset)
 fn glyphNameToUnicode(name: []const u8) u21 {
-    // Common glyph names - this is a subset; full AGL has 4000+ entries
-    const mappings = .{
-        .{ "space", ' ' },
-        .{ "exclam", '!' },
-        .{ "quotedbl", '"' },
-        .{ "numbersign", '#' },
-        .{ "dollar", '$' },
-        .{ "percent", '%' },
-        .{ "ampersand", '&' },
-        .{ "quotesingle", '\'' },
-        .{ "parenleft", '(' },
-        .{ "parenright", ')' },
-        .{ "asterisk", '*' },
-        .{ "plus", '+' },
-        .{ "comma", ',' },
-        .{ "hyphen", '-' },
-        .{ "period", '.' },
-        .{ "slash", '/' },
-        .{ "zero", '0' },
-        .{ "one", '1' },
-        .{ "two", '2' },
-        .{ "three", '3' },
-        .{ "four", '4' },
-        .{ "five", '5' },
-        .{ "six", '6' },
-        .{ "seven", '7' },
-        .{ "eight", '8' },
-        .{ "nine", '9' },
-        .{ "colon", ':' },
-        .{ "semicolon", ';' },
-        .{ "less", '<' },
-        .{ "equal", '=' },
-        .{ "greater", '>' },
-        .{ "question", '?' },
-        .{ "at", '@' },
-        .{ "A", 'A' },
-        .{ "B", 'B' },
-        .{ "C", 'C' },
-        .{ "D", 'D' },
-        .{ "E", 'E' },
-        .{ "F", 'F' },
-        .{ "G", 'G' },
-        .{ "H", 'H' },
-        .{ "I", 'I' },
-        .{ "J", 'J' },
-        .{ "K", 'K' },
-        .{ "L", 'L' },
-        .{ "M", 'M' },
-        .{ "N", 'N' },
-        .{ "O", 'O' },
-        .{ "P", 'P' },
-        .{ "Q", 'Q' },
-        .{ "R", 'R' },
-        .{ "S", 'S' },
-        .{ "T", 'T' },
-        .{ "U", 'U' },
-        .{ "V", 'V' },
-        .{ "W", 'W' },
-        .{ "X", 'X' },
-        .{ "Y", 'Y' },
-        .{ "Z", 'Z' },
-        .{ "bracketleft", '[' },
-        .{ "backslash", '\\' },
-        .{ "bracketright", ']' },
-        .{ "asciicircum", '^' },
-        .{ "underscore", '_' },
-        .{ "grave", '`' },
-        .{ "a", 'a' },
-        .{ "b", 'b' },
-        .{ "c", 'c' },
-        .{ "d", 'd' },
-        .{ "e", 'e' },
-        .{ "f", 'f' },
-        .{ "g", 'g' },
-        .{ "h", 'h' },
-        .{ "i", 'i' },
-        .{ "j", 'j' },
-        .{ "k", 'k' },
-        .{ "l", 'l' },
-        .{ "m", 'm' },
-        .{ "n", 'n' },
-        .{ "o", 'o' },
-        .{ "p", 'p' },
-        .{ "q", 'q' },
-        .{ "r", 'r' },
-        .{ "s", 's' },
-        .{ "t", 't' },
-        .{ "u", 'u' },
-        .{ "v", 'v' },
-        .{ "w", 'w' },
-        .{ "x", 'x' },
-        .{ "y", 'y' },
-        .{ "z", 'z' },
-        .{ "braceleft", '{' },
-        .{ "bar", '|' },
-        .{ "braceright", '}' },
-        .{ "asciitilde", '~' },
-        // Extended characters
-        .{ "bullet", 0x2022 },
-        .{ "endash", 0x2013 },
-        .{ "emdash", 0x2014 },
-        .{ "ellipsis", 0x2026 },
-        .{ "quoteleft", 0x2018 },
-        .{ "quoteright", 0x2019 },
-        .{ "quotedblleft", 0x201C },
-        .{ "quotedblright", 0x201D },
-        .{ "fi", 0xFB01 },
-        .{ "fl", 0xFB02 },
-        .{ "ff", 0xFB00 },
-        .{ "ffi", 0xFB03 },
-        .{ "ffl", 0xFB04 },
-    };
-
-    inline for (mappings) |mapping| {
-        if (std.mem.eql(u8, name, mapping[0])) {
-            return mapping[1];
-        }
+    if (agl.glyphNameToUnicode(name)) |u| {
+        return u;
     }
-
-    // Check for "uniXXXX" format
-    if (name.len == 7 and std.mem.startsWith(u8, name, "uni")) {
-        return std.fmt.parseInt(u21, name[3..7], 16) catch 0;
-    }
-
-    // Check for "uXXXXX" format
-    if (name.len >= 5 and name.len <= 7 and name[0] == 'u') {
-        return std.fmt.parseInt(u21, name[1..], 16) catch 0;
-    }
-
     return 0;
 }
 

@@ -238,7 +238,17 @@ fn walkPageTree(
     const mediabox = extractBox(dict, "MediaBox") orelse inherited_mediabox;
     const cropbox = extractBox(dict, "CropBox") orelse inherited_cropbox;
     const rotation = @as(i32, @intCast(dict.getInt("Rotate") orelse inherited_rotation));
-    const resources = dict.getDict("Resources") orelse inherited_resources;
+    
+    var resources = inherited_resources;
+    if (dict.get("Resources")) |res_obj| {
+        const resolved = switch (res_obj) {
+            .reference => |r| resolveRef(allocator, data, xref, r, cache) catch res_obj,
+            else => res_obj,
+        };
+        if (resolved == .dict) {
+            resources = resolved.dict;
+        }
+    }
 
     if (std.mem.eql(u8, type_name, "Pages")) {
         // Intermediate node - recurse into Kids

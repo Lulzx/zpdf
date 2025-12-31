@@ -244,102 +244,82 @@ pub const Document = struct {
     }
 
     /// Lazy-load fonts for a specific page (called on first extraction)
-    fn ensurePageFonts(self: *Document, page_idx: usize) void {
-        const arena = self.parsing_arena.allocator();
-        const page = self.pages.items[page_idx];
-        const resources = page.resources orelse return;
-        const fonts_dict = resources.getDict("Font") orelse return;
+fn ensurePageFonts(self: *Document, page_idx: usize) void {
+    const arena = self.parsing_arena.allocator();
+    const page = self.pages.items[page_idx];
+    if (page.resources == null) return;
+    const resources = page.resources.?;
+    const fonts_dict_obj = resources.get("Font") orelse return;
+    
+    const fonts_dict_resolved = switch (fonts_dict_obj) {
+        .reference => |ref| pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch null,
+        else => fonts_dict_obj,
+    };
 
-        for (fonts_dict.entries) |entry| {
-            // Create cache key
-            var key_buf: [64]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_idx, entry.key }) catch continue;
+    if (fonts_dict_resolved == null or fonts_dict_resolved.? != .dict) return;
 
-            // Skip if already cached
-            if (self.font_cache.contains(key)) continue;
+    const fonts_dict = fonts_dict_resolved.?.dict;
 
-            // Resolve font dictionary
-            const font_obj = switch (entry.value) {
-                .reference => |ref| pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch continue,
-                .dict => entry.value,
-                else => continue,
-            };
+    for (fonts_dict.entries) |entry| {
+        // Create cache key
+        var key_buf: [64]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_idx, entry.key }) catch continue;
 
-            const fd = switch (font_obj) {
-                .dict => |d| d,
-                else => continue,
-            };
+        // Skip if already cached
+        if (self.font_cache.contains(key)) continue;
 
-            // Create font encoding
-            var enc = encoding.FontEncoding.init(arena);
+        // Resolve font dictionary
+        const font_obj = switch (entry.value) {
+            .reference => |ref| pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch continue,
+            .dict => entry.value,
+            else => continue,
+        };
 
-            // Check for Type0 (CID) font
-            const subtype = fd.getName("Subtype");
-            const is_type0 = subtype != null and std.mem.eql(u8, subtype.?, "Type0");
+        const fd = switch (font_obj) {
+            .dict => |d| d,
+            else => continue,
+        };
 
-            if (is_type0) {
-                enc.is_cid = true;
-                enc.bytes_per_char = 2;
+        const Resolver = struct {
+            arena: std.mem.Allocator,
+            data: []const u8,
+            xref_table: *const xref.XRefTable,
+            object_cache: *std.AutoHashMap(u32, parser.Object),
+
+            fn resolve(self_resolver: @This(), obj: parser.Object) parser.Object {
+                return switch (obj) {
+                    .reference => |ref| pagetree.resolveRef(self_resolver.arena, self_resolver.data, self_resolver.xref_table, ref, self_resolver.object_cache) catch obj,
+                    else => obj,
+                };
+            }
+        };
+        const resolver = Resolver{
+            .arena = arena,
+            .data = self.data,
+            .xref_table = &self.xref_table,
+            .object_cache = &self.object_cache,
+        };
+
+        // Use the comprehensive parseFontEncoding
+        const enc = encoding.parseFontEncoding(arena, fd, struct {
+            fn wrapper(ctx: *const anyopaque, obj: parser.Object) parser.Object {
+                const r: *const Resolver = @alignCast(@ptrCast(ctx));
+                return r.resolve(obj);
+            }
+        }.wrapper, &resolver) catch |err| {
+            if (self.error_config.continue_on_encoding_error) {
+                continue;
             } else {
-                // For simple fonts, apply encoding (WinAnsi, MacRoman, etc.)
-                if (fd.get("Encoding")) |enc_obj| {
-                    switch (enc_obj) {
-                        .name => |name| encoding.applyNamedEncoding(&enc, name),
-                        .reference => |ref| {
-                            // Resolve encoding reference
-                            const resolved = pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch null;
-                            if (resolved) |res| {
-                                switch (res) {
-                                    .name => |name| encoding.applyNamedEncoding(&enc, name),
-                                    .dict => |dict| {
-                                        // Encoding dict with BaseEncoding and/or Differences
-                                        if (dict.getName("BaseEncoding")) |base| {
-                                            encoding.applyNamedEncoding(&enc, base);
-                                        }
-                                        if (dict.getArray("Differences")) |diffs| {
-                                            encoding.applyDifferences(&enc, diffs) catch {};
-                                        }
-                                    },
-                                    else => {},
-                                }
-                            }
-                        },
-                        .dict => |dict| {
-                            // Inline encoding dict
-                            if (dict.getName("BaseEncoding")) |base| {
-                                encoding.applyNamedEncoding(&enc, base);
-                            }
-                            if (dict.getArray("Differences")) |diffs| {
-                                encoding.applyDifferences(&enc, diffs) catch {};
-                            }
-                        },
-                        else => {},
-                    }
-                }
+                std.debug.print("Error parsing font {s}: {}\n", .{ entry.key, err });
+                continue;
             }
+        };
 
-            // Parse ToUnicode CMap (highest priority - overrides other encodings)
-            if (fd.get("ToUnicode")) |tounicode| {
-                switch (tounicode) {
-                    .stream => |s| encoding.parseToUnicodeCMap(arena, s, &enc) catch {},
-                    .reference => |ref| {
-                        // Resolve ToUnicode reference
-                        const resolved = pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch null;
-                        if (resolved) |res| {
-                            if (res == .stream) {
-                                encoding.parseToUnicodeCMap(arena, res.stream, &enc) catch {};
-                            }
-                        }
-                    },
-                    else => {},
-                }
-            }
-
-            // Need to dupe key since bufPrint uses stack buffer
-            const owned_key = arena.dupe(u8, key) catch continue;
-            self.font_cache.put(owned_key, enc) catch {};
-        }
+        // Need to dupe key since bufPrint uses stack buffer
+        const owned_key = arena.dupe(u8, key) catch continue;
+        self.font_cache.put(owned_key, enc) catch {};
     }
+}
 
     /// Close the document and free resources
     pub fn close(self: *Document) void {
