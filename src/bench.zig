@@ -34,16 +34,12 @@ pub fn main() !void {
 
     const pdf_path = args[1];
     var skip_mutool = false;
-    var verbose = false;
 
     for (args[2..]) |arg| {
         if (std.mem.eql(u8, arg, "--no-mutool")) skip_mutool = true;
-        if (std.mem.eql(u8, arg, "--verbose")) verbose = true;
     }
 
-    const stdout = std.io.getStdOut().writer();
-
-    try stdout.print(
+    std.debug.print(
         \\╔══════════════════════════════════════════════════════════════╗
         \\║                    ZPDF Benchmark Suite                      ║
         \\╚══════════════════════════════════════════════════════════════╝
@@ -60,12 +56,12 @@ pub fn main() !void {
     const file_size = (try file.stat()).size;
     file.close();
 
-    try stdout.print("Size: {d:.2} MB\n\n", .{@as(f64, @floatFromInt(file_size)) / (1024 * 1024)});
+    std.debug.print("Size: {d:.2} MB\n\n", .{@as(f64, @floatFromInt(file_size)) / (1024 * 1024)});
 
     // Benchmark ZPDF
-    try stdout.writeAll("── ZPDF Performance ───────────────────────────────────────────\n");
+    std.debug.print("── ZPDF Performance ───────────────────────────────────────────\n", .{});
 
-    var times: [BENCH_RUNS]i64 = undefined;
+    var times: [BENCH_RUNS]i128 = undefined;
     var page_count: usize = 0;
 
     for (&times) |*t| {
@@ -89,30 +85,28 @@ pub fn main() !void {
     }
 
     const stats = calcStats(&times);
-    try stdout.print("Time:      {d:>8.2} ms (±{d:.2})\n", .{ stats.mean / 1e6, stats.stddev / 1e6 });
-    try stdout.print("Pages:     {}\n", .{page_count});
-    try stdout.print("Throughput:{d:>8.2} MB/s\n", .{
+    std.debug.print("Time:      {d:>8.2} ms (±{d:.2})\n", .{ stats.mean / 1e6, stats.stddev / 1e6 });
+    std.debug.print("Pages:     {}\n", .{page_count});
+    std.debug.print("Throughput:{d:>8.2} MB/s\n", .{
         @as(f64, @floatFromInt(file_size)) / (stats.mean / 1e9) / (1024 * 1024),
     });
 
     // MuPDF comparison
     if (!skip_mutool) {
-        try stdout.writeAll("\n── MuPDF Comparison ───────────────────────────────────────────\n");
+        std.debug.print("\n── MuPDF Comparison ───────────────────────────────────────────\n", .{});
 
         if (benchMutool(allocator, pdf_path)) |mutool_ns| {
-            try stdout.print("MuPDF:     {d:>8.2} ms\n", .{mutool_ns / 1e6});
-            try stdout.print("Speedup:   {d:>8.2}x\n", .{mutool_ns / stats.mean});
+            std.debug.print("MuPDF:     {d:>8.2} ms\n", .{mutool_ns / 1e6});
+            std.debug.print("Speedup:   {d:>8.2}x\n", .{mutool_ns / stats.mean});
         } else |_| {
-            try stdout.writeAll("(mutool not found)\n");
+            std.debug.print("(mutool not found)\n", .{});
         }
     }
-
-    _ = verbose;
 }
 
 const Stats = struct { mean: f64, stddev: f64 };
 
-fn calcStats(times: []const i64) Stats {
+fn calcStats(times: []const i128) Stats {
     var sum: f64 = 0;
     for (times) |t| sum += @floatFromInt(t);
     const mean = sum / @as(f64, @floatFromInt(times.len));
