@@ -22,3 +22,8 @@ typedef struct {
 
 CTextSpan* zpdf_extract_bounds(ZpdfDocument* doc, int page_num, size_t* out_count);
 void zpdf_free_bounds(CTextSpan* ptr, size_t count);
+
+// Reading order extraction (visual order, not stream order)
+uint8_t* zpdf_extract_page_reading_order(ZpdfDocument* doc, int page_num, size_t* out_len);
+uint8_t* zpdf_extract_all_reading_order(ZpdfDocument* doc, size_t* out_len);
+uint8_t* zpdf_extract_all_reading_order_parallel(ZpdfDocument* doc, size_t* out_len);

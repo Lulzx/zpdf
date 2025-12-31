@@ -57,22 +57,23 @@ pub const LayoutResult = struct {
     }
 
     /// Get text in reading order
+    /// Uses the sorted spans directly (sorted by Y desc, then X asc)
     pub fn getTextInOrder(self: *const LayoutResult, allocator: std.mem.Allocator) ![]u8 {
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
 
-        for (self.reading_order) |col_idx| {
-            if (col_idx < self.columns.len) {
-                const col = self.columns[col_idx];
-                for (col.lines) |line| {
-                    for (line.words) |word| {
-                        try result.appendSlice(allocator, word.bounds.text);
-                        try result.append(allocator, ' ');
-                    }
-                    try result.append(allocator, '\n');
-                }
+        // Simple approach: use the sorted spans directly
+        // Spans are already sorted by Y (descending) then X (ascending)
+        var prev_y: f64 = if (self.spans.len > 0) self.spans[0].y0 else 0;
+        const line_threshold: f64 = 10;
+
+        for (self.spans) |span| {
+            // Check if we've moved to a new line
+            if (@abs(span.y0 - prev_y) > line_threshold) {
                 try result.append(allocator, '\n');
+                prev_y = span.y0;
             }
+            try result.appendSlice(allocator, span.text);
         }
 
         return result.toOwnedSlice(allocator);

@@ -100,15 +100,28 @@ class Document:
 
         return PageInfo(width[0], height[0], rotation[0])
 
-    def extract_page(self, page_num: int) -> str:
+    def extract_page(self, page_num: int, reading_order: bool = False) -> str:
+        """Extract text from a single page.
+
+        Args:
+            page_num: Page number (0-indexed)
+            reading_order: If True, returns text in visual reading order
+                          (left-to-right, top-to-bottom with column detection).
+                          If False (default), returns text in PDF stream order.
+        """
         self._check_open()
         if page_num < 0 or page_num >= self.page_count:
             raise PageNotFoundError(f"Page {page_num} not found")
 
         out_len = ffi.new("size_t*")
-        buf_ptr = lib.zpdf_extract_page(self._handle, page_num, out_len)
+        if reading_order:
+            buf_ptr = lib.zpdf_extract_page_reading_order(self._handle, page_num, out_len)
+        else:
+            buf_ptr = lib.zpdf_extract_page(self._handle, page_num, out_len)
 
         if buf_ptr == ffi.NULL:
+            if out_len[0] == 0:
+                return ""  # Empty page
             raise ExtractionError(f"Failed to extract page {page_num}")
 
         try:
@@ -117,16 +130,32 @@ class Document:
         finally:
             lib.zpdf_free_buffer(buf_ptr, out_len[0])
 
-    def extract_all(self, parallel: bool = True) -> str:
+    def extract_all(self, parallel: bool = True, reading_order: bool = False) -> str:
+        """Extract text from all pages.
+
+        Args:
+            parallel: If True (default), use multi-threaded extraction for speed.
+            reading_order: If True, returns text in visual reading order
+                          (left-to-right, top-to-bottom with column detection).
+                          If False (default), returns text in PDF stream order.
+        """
         self._check_open()
         out_len = ffi.new("size_t*")
 
-        if parallel:
-            buf_ptr = lib.zpdf_extract_all_parallel(self._handle, out_len)
+        if reading_order:
+            if parallel:
+                buf_ptr = lib.zpdf_extract_all_reading_order_parallel(self._handle, out_len)
+            else:
+                buf_ptr = lib.zpdf_extract_all_reading_order(self._handle, out_len)
         else:
-            buf_ptr = lib.zpdf_extract_all(self._handle, out_len)
+            if parallel:
+                buf_ptr = lib.zpdf_extract_all_parallel(self._handle, out_len)
+            else:
+                buf_ptr = lib.zpdf_extract_all(self._handle, out_len)
 
         if buf_ptr == ffi.NULL:
+            if out_len[0] == 0:
+                return ""  # Empty document
             raise ExtractionError("Failed to extract text")
 
         try:

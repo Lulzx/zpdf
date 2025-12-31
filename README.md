@@ -105,11 +105,12 @@ pub fn main() !void {
 ### CLI
 
 ```bash
-zpdf extract document.pdf           # Extract all pages to stdout
-zpdf extract -p 1-10 document.pdf   # Extract pages 1-10
-zpdf extract -o out.txt document.pdf # Output to file
-zpdf info document.pdf              # Show document info
-zpdf bench document.pdf             # Run benchmark
+zpdf extract document.pdf              # Extract all pages to stdout
+zpdf extract -p 1-10 document.pdf      # Extract pages 1-10
+zpdf extract -o out.txt document.pdf   # Output to file
+zpdf extract --reading-order doc.pdf   # Use visual reading order (experimental)
+zpdf info document.pdf                 # Show document info
+zpdf bench document.pdf                # Run benchmark
 ```
 
 ### Python
@@ -125,6 +126,9 @@ with zpdf.Document("file.pdf") as doc:
 
     # All pages (parallel by default)
     all_text = doc.extract_all()
+
+    # Reading order extraction (experimental)
+    ordered_text = doc.extract_all(reading_order=True)
 
     # Page info
     info = doc.get_page_info(0)

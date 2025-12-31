@@ -39,10 +39,17 @@ def word_error_rate(hyp: str, ref: str, max_words: int = 2000) -> float:
     return 1.0 - matcher.ratio()
 
 
-def extract_zpdf(pdf_path: str) -> tuple:
+def extract_zpdf(pdf_path: str, reading_order: bool = True) -> tuple:
+    """Extract text using zpdf.
+
+    Args:
+        pdf_path: Path to PDF file
+        reading_order: If True (default), use reading order (visual order).
+                      If False, use stream order (faster but may not match visual layout).
+    """
     start = time.perf_counter()
     doc = zpdf.Document(pdf_path)
-    text = doc.extract_all(parallel=True)
+    text = doc.extract_all(parallel=True, reading_order=reading_order)
     pages = doc.page_count
     doc.close()
     elapsed = (time.perf_counter() - start) * 1000
@@ -110,7 +117,7 @@ def main():
     print("ZPDF Accuracy Benchmark")
     print()
     print("Reference: MuPDF (mutool)")
-    print(f"Tools: zpdf, mutool{', tika' if has_tika else ''}{', pdftotext' if has_pdftotext else ''}")
+    print(f"Tools: zpdf (reading order), zpdf (stream order), mutool{', tika' if has_tika else ''}{', pdftotext' if has_pdftotext else ''}")
     print()
 
     for pdf in pdf_files:
@@ -118,7 +125,10 @@ def main():
 
         try:
             # Extract with all tools
-            zpdf_text, zpdf_ms, pages = extract_zpdf(str(pdf))
+            # zpdf with reading order (default)
+            zpdf_ro_text, zpdf_ro_ms, pages = extract_zpdf(str(pdf), reading_order=True)
+            # zpdf with stream order (for comparison)
+            zpdf_so_text, zpdf_so_ms, _ = extract_zpdf(str(pdf), reading_order=False)
             mutool_text, mutool_ms = extract_mutool(str(pdf))
 
             tika_text, tika_ms = ("", 0)
@@ -130,7 +140,8 @@ def main():
                 pdftotext_text, pdftotext_ms = extract_pdftotext(str(pdf))
 
             # Normalize
-            zpdf_norm = normalize(zpdf_text)
+            zpdf_ro_norm = normalize(zpdf_ro_text)
+            zpdf_so_norm = normalize(zpdf_so_text)
             mutool_norm = normalize(mutool_text)
             tika_norm = normalize(tika_text) if has_tika else ""
             pdftotext_norm = normalize(pdftotext_text) if has_pdftotext else ""
@@ -138,30 +149,37 @@ def main():
             # Compute metrics vs MuPDF reference
             print(f"Pages: {pages}")
             print()
-            print(f"{'Tool':<12} {'Char Acc':>10} {'WER':>8} {'Time':>10} {'Speedup':>10}")
-            print("-" * 52)
+            print(f"{'Tool':<20} {'Char Acc':>10} {'WER':>8} {'Time':>10} {'Speedup':>10}")
+            print("-" * 60)
 
-            # zpdf
-            acc = char_accuracy(zpdf_norm, mutool_norm)
-            wer = word_error_rate(zpdf_norm, mutool_norm)
-            print(f"{'zpdf':<12} {acc:>9.1%} {wer:>7.1%} {zpdf_ms:>8.0f}ms {mutool_ms/zpdf_ms:>9.1f}x")
+            # zpdf (reading order) - default
+            acc = char_accuracy(zpdf_ro_norm, mutool_norm)
+            wer = word_error_rate(zpdf_ro_norm, mutool_norm)
+            speedup = mutool_ms / zpdf_ro_ms if zpdf_ro_ms > 0 else 0
+            print(f"{'zpdf (reading)':<20} {acc:>9.1%} {wer:>7.1%} {zpdf_ro_ms:>8.0f}ms {speedup:>9.1f}x")
+
+            # zpdf (stream order) - for comparison
+            acc = char_accuracy(zpdf_so_norm, mutool_norm)
+            wer = word_error_rate(zpdf_so_norm, mutool_norm)
+            speedup = mutool_ms / zpdf_so_ms if zpdf_so_ms > 0 else 0
+            print(f"{'zpdf (stream)':<20} {acc:>9.1%} {wer:>7.1%} {zpdf_so_ms:>8.0f}ms {speedup:>9.1f}x")
 
             # MuPDF (reference = 100%)
-            print(f"{'mutool':<12} {'100.0%':>10} {'0.0%':>8} {mutool_ms:>8.0f}ms {'1.0x':>10}")
+            print(f"{'mutool':<20} {'100.0%':>10} {'0.0%':>8} {mutool_ms:>8.0f}ms {'1.0x':>10}")
 
             # Tika
             if has_tika:
                 acc = char_accuracy(tika_norm, mutool_norm)
                 wer = word_error_rate(tika_norm, mutool_norm)
                 speedup = mutool_ms / tika_ms if tika_ms > 0 else 0
-                print(f"{'tika':<12} {acc:>9.1%} {wer:>7.1%} {tika_ms:>8.0f}ms {speedup:>9.1f}x")
+                print(f"{'tika':<20} {acc:>9.1%} {wer:>7.1%} {tika_ms:>8.0f}ms {speedup:>9.1f}x")
 
             # pdftotext
             if has_pdftotext:
                 acc = char_accuracy(pdftotext_norm, mutool_norm)
                 wer = word_error_rate(pdftotext_norm, mutool_norm)
                 speedup = mutool_ms / pdftotext_ms if pdftotext_ms > 0 else 0
-                print(f"{'pdftotext':<12} {acc:>9.1%} {wer:>7.1%} {pdftotext_ms:>8.0f}ms {speedup:>9.1f}x")
+                print(f"{'pdftotext':<20} {acc:>9.1%} {wer:>7.1%} {pdftotext_ms:>8.0f}ms {speedup:>9.1f}x")
 
             print()
 

@@ -55,12 +55,13 @@ fn printUsage() !void {
         \\  help        Show this help
         \\
         \\Extract options:
-        \\  -o FILE       Output to file (default: stdout)
-        \\  -p PAGES      Page range (e.g., "1-10" or "1,3,5")
-        \\  --sequential  Disable parallel extraction
-        \\  --strict      Fail on any parse error
-        \\  --permissive  Continue past all errors
-        \\  --json        Output as JSON with positions
+        \\  -o FILE         Output to file (default: stdout)
+        \\  -p PAGES        Page range (e.g., "1-10" or "1,3,5")
+        \\  --sequential    Disable parallel extraction
+        \\  --reading-order Use visual reading order (experimental, slower)
+        \\  --strict        Fail on any parse error
+        \\  --permissive    Continue past all errors
+        \\  --json          Output as JSON with positions
         \\
         \\Examples:
         \\  zpdf extract document.pdf              # All pages to stdout
@@ -78,6 +79,7 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var error_mode: zpdf.ErrorConfig = zpdf.ErrorConfig.default();
     var json_output = false;
     var sequential = false;
+    var stream_order = true; // Default to stream order (faster, higher accuracy)
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -97,6 +99,10 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--sequential")) {
             sequential = true;
+        } else if (std.mem.eql(u8, arg, "--stream-order")) {
+            stream_order = true;
+        } else if (std.mem.eql(u8, arg, "--reading-order")) {
+            stream_order = false;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             input_file = arg;
         }
@@ -139,10 +145,16 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     if (use_parallel) {
         // Parallel extraction - get all text at once
-        const result = doc.extractAllTextParallel(allocator) catch |err| {
-            std.debug.print("Error during parallel extraction: {}\n", .{err});
-            return;
-        };
+        const result = if (stream_order)
+            doc.extractAllTextParallel(allocator) catch |err| {
+                std.debug.print("Error during parallel extraction: {}\n", .{err});
+                return;
+            }
+        else
+            extractAllTextReadingOrderParallel(doc, allocator) catch |err| {
+                std.debug.print("Error during parallel extraction: {}\n", .{err});
+                return;
+            };
         defer allocator.free(result);
 
         if (output_handle) |h| {
@@ -160,12 +172,12 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
         var file_writer = h.writer(&write_buf);
         const writer = &file_writer.interface;
         defer writer.flush() catch {};
-        try doExtract(doc, pages, json_output, writer);
+        try doExtract(doc, pages, json_output, stream_order, allocator, writer);
     } else {
         var stdout_writer = std.fs.File.stdout().writer(&write_buf);
         const writer = &stdout_writer.interface;
         defer writer.flush() catch {};
-        try doExtract(doc, pages, json_output, writer);
+        try doExtract(doc, pages, json_output, stream_order, allocator, writer);
     }
 
     // Report errors if any
@@ -184,7 +196,7 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 }
 
-fn doExtract(doc: *zpdf.Document, pages: []const usize, json_output: bool, writer: anytype) !void {
+fn doExtract(doc: *zpdf.Document, pages: []const usize, json_output: bool, stream_order: bool, allocator: std.mem.Allocator, writer: anytype) !void {
     if (json_output) {
         try writer.writeAll("{\n  \"pages\": [\n");
     }
@@ -195,10 +207,20 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, json_output: bool, write
             try writer.print("    {{\"page\": {}, \"text\": \"", .{page_num + 1});
         }
 
-        doc.extractText(page_num, writer) catch |err| {
-            std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-            continue;
-        };
+        if (stream_order) {
+            doc.extractText(page_num, writer) catch |err| {
+                std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
+                continue;
+            };
+        } else {
+            // Reading order extraction
+            const text = extractPageReadingOrder(doc, page_num, allocator) catch |err| {
+                std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
+                continue;
+            };
+            defer allocator.free(text);
+            try writer.writeAll(text);
+        }
 
         if (json_output) {
             try writer.writeAll("\"}");
@@ -210,6 +232,119 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, json_output: bool, write
     if (json_output) {
         try writer.writeAll("\n  ]\n}\n");
     }
+}
+
+/// Extract text from a single page in reading order
+fn extractPageReadingOrder(doc: *zpdf.Document, page_num: usize, allocator: std.mem.Allocator) ![]u8 {
+    const page = doc.pages.items[page_num];
+    const page_width = page.media_box[2] - page.media_box[0];
+
+    const spans = try doc.extractTextWithBounds(page_num, allocator);
+    if (spans.len == 0) {
+        return allocator.alloc(u8, 0);
+    }
+    defer allocator.free(spans);
+
+    var layout_result = try zpdf.layout.analyzeLayout(allocator, spans, page_width);
+    defer layout_result.deinit();
+
+    return layout_result.getTextInOrder(allocator);
+}
+
+/// Extract text from all pages in reading order (parallel)
+fn extractAllTextReadingOrderParallel(doc: *zpdf.Document, allocator: std.mem.Allocator) ![]u8 {
+    const num_pages = doc.pages.items.len;
+    if (num_pages == 0) return try allocator.alloc(u8, 0);
+
+    // Allocate result buffers for each page
+    const results = try allocator.alloc([]u8, num_pages);
+    defer allocator.free(results);
+    @memset(results, &[_]u8{});
+
+    const Thread = std.Thread;
+    const cpu_count = Thread.getCpuCount() catch 4;
+    const num_threads: usize = @min(num_pages, @min(cpu_count, 8));
+
+    const Context = struct {
+        doc: *zpdf.Document,
+        results: [][]u8,
+        alloc: std.mem.Allocator,
+    };
+
+    const ctx = Context{
+        .doc = doc,
+        .results = results,
+        .alloc = allocator,
+    };
+
+    const worker = struct {
+        fn run(c: Context, start: usize, end: usize) void {
+            for (start..end) |page_idx| {
+                const page = c.doc.pages.items[page_idx];
+                const page_width = page.media_box[2] - page.media_box[0];
+
+                const spans = c.doc.extractTextWithBounds(page_idx, c.alloc) catch continue;
+                if (spans.len == 0) continue;
+                defer c.alloc.free(spans);
+
+                var layout_result = zpdf.layout.analyzeLayout(c.alloc, spans, page_width) catch continue;
+                defer layout_result.deinit();
+
+                const text = layout_result.getTextInOrder(c.alloc) catch continue;
+                c.results[page_idx] = text;
+            }
+        }
+    }.run;
+
+    // Spawn threads
+    var threads: [8]?Thread = [_]?Thread{null} ** 8;
+    const pages_per_thread = (num_pages + num_threads - 1) / num_threads;
+
+    for (0..num_threads) |i| {
+        const start = i * pages_per_thread;
+        const end = @min(start + pages_per_thread, num_pages);
+        if (start < end) {
+            threads[i] = Thread.spawn(.{}, worker, .{ ctx, start, end }) catch null;
+        }
+    }
+
+    // Wait for all threads
+    for (&threads) |*t| {
+        if (t.*) |thread| thread.join();
+    }
+
+    // Calculate total size
+    var total_size: usize = 0;
+    var non_empty_count: usize = 0;
+    for (results) |r| {
+        if (r.len > 0) {
+            total_size += r.len;
+            non_empty_count += 1;
+        }
+    }
+    if (non_empty_count > 1) {
+        total_size += non_empty_count - 1; // separators
+    }
+
+    if (total_size == 0) return allocator.alloc(u8, 0);
+
+    var output = try allocator.alloc(u8, total_size);
+    var pos: usize = 0;
+    var first_written = false;
+    for (results) |r| {
+        if (r.len > 0) {
+            if (first_written) {
+                output[pos] = '\x0c';
+                pos += 1;
+            }
+            @memcpy(output[pos..][0..r.len], r);
+            pos += r.len;
+            allocator.free(r);
+            first_written = true;
+        }
+    }
+
+    return output;
 }
 
 fn runInfo(allocator: std.mem.Allocator, args: []const []const u8) !void {
