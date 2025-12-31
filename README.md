@@ -187,4 +187,4 @@ examples/            # Usage examples
 
 ## License
 
-MIT
+WTFPL
