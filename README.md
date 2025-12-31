@@ -1,4 +1,4 @@
-# zpdf
+# zpdf (alpha stage - early version)
 
 A PDF text extraction library written in Zig.
 
