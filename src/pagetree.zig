@@ -83,6 +83,7 @@ fn resolveCompressedObject(
     // Get the object stream
     const objstm_entry = xref.get(objstm_num) orelse return Object{ .null = {} };
     if (objstm_entry.entry_type != .in_use) return Object{ .null = {} };
+    if (objstm_entry.offset >= data.len) return Object{ .null = {} };
 
     var p = parser.Parser.initAt(allocator, data, @intCast(objstm_entry.offset));
     const indirect = p.parseIndirectObject() catch return Object{ .null = {} };
