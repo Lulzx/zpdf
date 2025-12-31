@@ -14,16 +14,17 @@ A PDF text extraction library written in Zig.
 
 ## Benchmark
 
-Text extraction performance comparison on Apple M4 Pro:
+Text extraction performance on Apple M4 Pro (parallel, stream order):
 
-| Document | Pages | zpdf | pdfium | MuPDF | Tika |
-|----------|------:|-----:|-------:|------:|-----:|
-| [Intel SDM](https://cdrdv2.intel.com/v1/dl/getContent/671200) | 5,252 | **3,132 p/s** | 1,446 p/s | 2,253 p/s | 106 p/s |
-| [Pandas Docs](https://pandas.pydata.org/pandas-docs/version/1.4/pandas.pdf) | 3,743 | 554 p/s | 1,573 p/s | **3,025 p/s** | 70 p/s |
-| [C++ Standard](https://open-std.org/jtc1/sc22/wg21/docs/papers/2023/n4950.pdf) | 2,134 | 359 p/s | 1,087 p/s | **1,978 p/s** | 344 p/s |
-| arXiv Paper | 7 | **555 p/s** | 114 p/s | 249 p/s | 2 p/s |
+| Document | Pages | zpdf | pdfium | MuPDF |
+|----------|------:|-----:|-------:|------:|
+| [Intel SDM](https://cdrdv2.intel.com/v1/dl/getContent/671200) | 5,252 | **1,640ms** | 3,632ms | 2,331ms |
+| [C++ Standard](https://open-std.org/jtc1/sc22/wg21/docs/papers/2023/n4950.pdf) | 2,134 | 5,835ms | 1,964ms | **1,079ms** |
+| [Pandas Docs](https://pandas.pydata.org/pandas-docs/version/1.4/pandas.pdf) | 3,743 | 6,656ms | 2,379ms | **1,237ms** |
+| Acrobat Reference | 651 | **958ms** | - | - |
+| US Constitution | 85 | 172ms | 63ms | **58ms** |
 
-*p/s = pages per second. Higher is better. zpdf uses parallel extraction by default.*
+*Lower is better. zpdf uses parallel extraction by default.*
 
 ### Accuracy
 
@@ -34,7 +35,6 @@ All tools achieve ~99%+ character accuracy vs MuPDF reference:
 | zpdf | 99.3-99.9% | 1-8% |
 | pdfium | 99.2-100% | 0-4% |
 | MuPDF | 100% (ref) | 0% |
-| Tika | 97-100% | 0-11% |
 
 Build with `zig build -Doptimize=ReleaseFast` for best performance.
 
