@@ -410,10 +410,13 @@ fn ensurePageFonts(self: *Document, page_idx: usize) void {
 
         if (content.len == 0) return &.{};
 
+        // Lazy-load fonts for this page (needed for proper text decoding)
+        self.ensurePageFonts(page_num);
+
         var collector = interpreter.SpanCollector.init(allocator);
         errdefer collector.deinit();
 
-        try extractTextFromContentWithBounds(content, page.resources, &collector);
+        try extractTextFromContentWithBounds(content, page.resources, &collector, &self.font_cache, page_num);
         try collector.flush();
 
         return collector.spans.toOwnedSlice(collector.allocator);
@@ -640,7 +643,13 @@ fn writeTJArray(operand: interpreter.Operand, writer: anytype) !void {
     }
 }
 
-fn extractTextFromContentWithBounds(content: []const u8, resources: ?Object.Dict, collector: *interpreter.SpanCollector) !void {
+fn extractTextFromContentWithBounds(
+    content: []const u8,
+    resources: ?Object.Dict,
+    collector: *interpreter.SpanCollector,
+    font_cache: *std.StringHashMap(encoding.FontEncoding),
+    page_num: usize,
+) !void {
     _ = resources;
 
     var lexer = interpreter.ContentLexer.init(collector.allocator, content);
@@ -650,6 +659,10 @@ fn extractTextFromContentWithBounds(content: []const u8, resources: ?Object.Dict
     var current_x: f64 = 0;
     var current_y: f64 = 0;
     var font_size: f64 = 12;
+    var current_font: ?*const encoding.FontEncoding = null;
+
+    // Buffer for font cache key lookup
+    var key_buf: [64]u8 = undefined;
 
     while (try lexer.next()) |token| {
         switch (token) {
@@ -687,6 +700,13 @@ fn extractTextFromContentWithBounds(content: []const u8, resources: ?Object.Dict
                 if (op.len > 0) switch (op[0]) {
                     'T' => if (op.len == 2) switch (op[1]) {
                         'f' => if (operand_count >= 2) {
+                            // Set font: /FontName size Tf
+                            if (operands[0] == .name) {
+                                const font_name = operands[0].name;
+                                // Look up font with page:font_name key
+                                const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_num, font_name }) catch "";
+                                current_font = font_cache.getPtr(key);
+                            }
                             font_size = operands[1].number;
                             collector.setFontSize(font_size);
                         },
@@ -706,20 +726,20 @@ fn extractTextFromContentWithBounds(content: []const u8, resources: ?Object.Dict
                             try collector.flush();
                         },
                         'j' => if (operand_count >= 1) {
-                            try writeTextOperand(operands[0], collector);
+                            try writeTextToCollector(operands[0], current_font, collector);
                         },
                         'J' => if (operand_count >= 1) {
-                            try writeTJArrayWithBounds(operands[0], collector);
+                            try writeTJArrayToCollector(operands[0], current_font, collector);
                         },
                         else => {},
                     },
                     '\'' => if (operand_count >= 1) {
                         try collector.flush();
-                        try writeTextOperand(operands[0], collector);
+                        try writeTextToCollector(operands[0], current_font, collector);
                     },
                     '"' => if (operand_count >= 3) {
                         try collector.flush();
-                        try writeTextOperand(operands[2], collector);
+                        try writeTextToCollector(operands[2], current_font, collector);
                     },
                     else => {},
                 };
@@ -729,7 +749,38 @@ fn extractTextFromContentWithBounds(content: []const u8, resources: ?Object.Dict
     }
 }
 
-fn writeTJArrayWithBounds(operand: interpreter.Operand, collector: *interpreter.SpanCollector) !void {
+fn writeTextToCollector(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, collector: *interpreter.SpanCollector) !void {
+    const data = switch (operand) {
+        .string => |s| s,
+        .hex_string => |s| s,
+        else => return,
+    };
+
+    if (font) |enc| {
+        // Use font encoding to decode text
+        try enc.decode(data, collector);
+    } else {
+        // Fallback to simple WinAnsi-ish decoding
+        for (data) |byte| {
+            if (byte >= 32 and byte < 127) {
+                try collector.writeByte(byte);
+            } else if (byte == 0) {
+                // CID separator - ignore
+            } else {
+                const codepoint = encoding.win_ansi_encoding[byte];
+                if (codepoint != 0 and codepoint < 128) {
+                    try collector.writeByte(@truncate(codepoint));
+                } else if (codepoint != 0) {
+                    var buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(codepoint, &buf) catch 1;
+                    try collector.writeAll(buf[0..len]);
+                }
+            }
+        }
+    }
+}
+
+fn writeTJArrayToCollector(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, collector: *interpreter.SpanCollector) !void {
     const arr = switch (operand) {
         .array => |a| a,
         else => return,
@@ -737,17 +788,12 @@ fn writeTJArrayWithBounds(operand: interpreter.Operand, collector: *interpreter.
 
     for (arr) |item| {
         switch (item) {
-            .string, .hex_string => try writeTextOperand(item, collector),
+            .string, .hex_string => try writeTextToCollector(item, font, collector),
             .number => |n| {
                 // TJ spacing: negative = move right (add space), positive = move left (kern)
-                // Units are 1/1000 of em (font size)
-                // Only flush and create new span for significant spacing (word gaps)
-                // Typical word space is ~250-330 units, kerning is ~10-100 units
                 if (n < -150) {
-                    // Significant space - flush current span
                     try collector.flush();
                 }
-                // Always apply position adjustment
                 const adjustment = -n / 1000.0 * collector.current_font_size;
                 collector.current_x += adjustment;
             },

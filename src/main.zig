@@ -138,7 +138,9 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(pages);
 
     // Use parallel extraction by default for all pages (non-JSON mode)
-    const use_parallel = !sequential and !json_output and page_range == null;
+    // Note: parallel reading-order extraction has race condition in object cache,
+    // so we only use parallel for stream order extraction
+    const use_parallel = !sequential and !json_output and page_range == null and stream_order;
 
     // Use buffered output
     var write_buf: [4096]u8 = undefined;
