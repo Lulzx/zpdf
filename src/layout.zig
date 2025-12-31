@@ -59,24 +59,65 @@ pub const LayoutResult = struct {
     /// Get text in reading order
     /// Uses the sorted spans directly (sorted by Y desc, then X asc)
     pub fn getTextInOrder(self: *const LayoutResult, allocator: std.mem.Allocator) ![]u8 {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(allocator);
+        if (self.spans.len == 0) return try allocator.alloc(u8, 0);
 
-        // Simple approach: use the sorted spans directly
-        // Spans are already sorted by Y (descending) then X (ascending)
-        var prev_y: f64 = if (self.spans.len > 0) self.spans[0].y0 else 0;
         const line_threshold: f64 = 10;
 
+        // Pre-calculate total size needed (worst case: space between every span + newlines)
+        var total_len: usize = 0;
+        var separator_count: usize = 0;
+        var prev_y: f64 = self.spans[0].y0;
+        var prev_x1: f64 = self.spans[0].x0;
+        var prev_font_size: f64 = self.spans[0].font_size;
+
         for (self.spans) |span| {
-            // Check if we've moved to a new line
             if (@abs(span.y0 - prev_y) > line_threshold) {
-                try result.append(allocator, '\n');
+                separator_count += 1; // newline
                 prev_y = span.y0;
+                prev_x1 = span.x0;
+            } else {
+                // Use font-relative threshold: 20% of font size indicates word gap
+                const space_threshold = @max(1.0, prev_font_size * 0.2);
+                const gap = span.x0 - prev_x1;
+                if (gap > space_threshold) {
+                    separator_count += 1; // space
+                }
             }
-            try result.appendSlice(allocator, span.text);
+            total_len += span.text.len;
+            prev_x1 = span.x1;
+            prev_font_size = span.font_size;
         }
 
-        return result.toOwnedSlice(allocator);
+        // Allocate exact size needed
+        const result = try allocator.alloc(u8, total_len + separator_count);
+        var pos: usize = 0;
+        prev_y = self.spans[0].y0;
+        prev_x1 = self.spans[0].x0;
+        prev_font_size = self.spans[0].font_size;
+
+        for (self.spans, 0..) |span, i| {
+            if (i > 0) {
+                if (@abs(span.y0 - prev_y) > line_threshold) {
+                    result[pos] = '\n';
+                    pos += 1;
+                    prev_y = span.y0;
+                    prev_x1 = span.x0;
+                } else {
+                    const space_threshold = @max(1.0, prev_font_size * 0.2);
+                    const gap = span.x0 - prev_x1;
+                    if (gap > space_threshold) {
+                        result[pos] = ' ';
+                        pos += 1;
+                    }
+                }
+            }
+            @memcpy(result[pos..][0..span.text.len], span.text);
+            pos += span.text.len;
+            prev_x1 = span.x1;
+            prev_font_size = span.font_size;
+        }
+
+        return result[0..pos];
     }
 };
 
@@ -92,24 +133,142 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
         };
     }
 
-    // Sort spans by Y (descending) then X (ascending)
+    const line_threshold: f64 = 10;
+    const half_page = page_width / 2;
+    const column_margin = page_width * 0.05; // 5% margin for column detection
+
+    // Sort all spans by Y (top to bottom), then X (left to right)
     const sorted = try allocator.alloc(TextSpan, spans.len);
     @memcpy(sorted, spans);
 
-    std.mem.sort(TextSpan, sorted, {}, struct {
-        fn cmp(_: void, a: TextSpan, b: TextSpan) bool {
-            if (@abs(a.y0 - b.y0) > 5) return a.y0 > b.y0; // Higher Y first
-            return a.x0 < b.x0; // Left to right
+    std.mem.sort(TextSpan, sorted, line_threshold, struct {
+        fn cmp(threshold: f64, a: TextSpan, b: TextSpan) bool {
+            const a_row = @as(i64, @intFromFloat(a.y0 / threshold));
+            const b_row = @as(i64, @intFromFloat(b.y0 / threshold));
+            if (a_row != b_row) return a_row > b_row;
+            return a.x0 < b.x0;
         }
     }.cmp);
 
-    // Group into lines by Y position
-    var lines: std.ArrayList(TextLine) = .empty;
-    var current_line_spans: std.ArrayList(TextSpan) = .empty;
+    // Analyze column structure: count how many lines have both left and right content
+    var left_only: usize = 0;
+    var right_only: usize = 0;
+    var both_columns: usize = 0;
     var current_y: f64 = sorted[0].y0;
-    const line_threshold: f64 = 10;
+    var has_left = false;
+    var has_right = false;
 
     for (sorted) |span| {
+        if (@abs(span.y0 - current_y) > line_threshold) {
+            // Commit previous line stats
+            if (has_left and has_right) {
+                both_columns += 1;
+            } else if (has_left) {
+                left_only += 1;
+            } else if (has_right) {
+                right_only += 1;
+            }
+            current_y = span.y0;
+            has_left = false;
+            has_right = false;
+        }
+        const mid_x = (span.x0 + span.x1) / 2;
+        if (mid_x < half_page - column_margin) {
+            has_left = true;
+        } else if (mid_x > half_page + column_margin) {
+            has_right = true;
+        } else {
+            has_left = true; // Center content goes to left
+        }
+    }
+    // Count last line
+    if (has_left and has_right) {
+        both_columns += 1;
+    } else if (has_left) {
+        left_only += 1;
+    } else if (has_right) {
+        right_only += 1;
+    }
+
+    const total_lines = left_only + right_only + both_columns;
+    const is_two_column = both_columns > total_lines / 3; // >33% of lines have both columns
+
+    var result_spans = try std.ArrayList(TextSpan).initCapacity(allocator, spans.len);
+
+    if (is_two_column) {
+        // Two-column layout with possible full-width header
+        var header_spans = try std.ArrayList(TextSpan).initCapacity(allocator, spans.len / 10);
+        defer header_spans.deinit(allocator);
+        var left_spans = try std.ArrayList(TextSpan).initCapacity(allocator, spans.len / 2);
+        defer left_spans.deinit(allocator);
+        var right_spans = try std.ArrayList(TextSpan).initCapacity(allocator, spans.len / 2);
+        defer right_spans.deinit(allocator);
+
+        // Find where two-column content starts (first line with both left and right content)
+        var two_col_start_y: f64 = -999999;
+        var line_y: f64 = sorted[0].y0;
+        var line_has_left = false;
+        var line_has_right = false;
+
+        for (sorted) |span| {
+            if (@abs(span.y0 - line_y) > line_threshold) {
+                // Check if previous line had both columns
+                if (line_has_left and line_has_right) {
+                    two_col_start_y = line_y;
+                    break;
+                }
+                line_y = span.y0;
+                line_has_left = false;
+                line_has_right = false;
+            }
+            const mid_x = (span.x0 + span.x1) / 2;
+            if (mid_x < half_page - column_margin) {
+                line_has_left = true;
+            } else if (mid_x > half_page + column_margin) {
+                line_has_right = true;
+            }
+        }
+
+        // Classify spans: header (above two-col start) or left/right column
+        for (sorted) |span| {
+            if (span.y0 > two_col_start_y + line_threshold) {
+                // Header content (above two-column region)
+                try header_spans.append(allocator, span);
+            } else {
+                const mid_x = (span.x0 + span.x1) / 2;
+                if (mid_x < half_page) {
+                    try left_spans.append(allocator, span);
+                } else {
+                    try right_spans.append(allocator, span);
+                }
+            }
+        }
+
+        // Output order: header first, then left column, then right column
+        for (header_spans.items) |span| {
+            try result_spans.append(allocator, span);
+        }
+        for (left_spans.items) |span| {
+            try result_spans.append(allocator, span);
+        }
+        for (right_spans.items) |span| {
+            try result_spans.append(allocator, span);
+        }
+    } else {
+        // Single column: just use sorted order
+        for (sorted) |span| {
+            try result_spans.append(allocator, span);
+        }
+    }
+
+    allocator.free(sorted);
+
+    // Build lines from the ordered spans
+    var lines = try std.ArrayList(TextLine).initCapacity(allocator, spans.len / 10);
+    var current_line_spans = try std.ArrayList(TextSpan).initCapacity(allocator, 20);
+    current_y = if (result_spans.items.len > 0) result_spans.items[0].y0 else 0;
+
+    for (result_spans.items) |span| {
         if (@abs(span.y0 - current_y) > line_threshold) {
             if (current_line_spans.items.len > 0) {
                 try lines.append(allocator, try makeLine(allocator, current_line_spans.items));
@@ -124,56 +283,36 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
     }
     current_line_spans.deinit(allocator);
 
-    // Detect columns
-    var columns: std.ArrayList(TextColumn) = .empty;
-    const column_gap = page_width * 0.1;
-    var left_lines: std.ArrayList(TextLine) = .empty;
-    var right_lines: std.ArrayList(TextLine) = .empty;
-
-    for (lines.items) |line| {
-        const mid_x = (line.bounds.x0 + line.bounds.x1) / 2;
-        if (mid_x < page_width / 2 - column_gap / 2) {
-            try left_lines.append(allocator, line);
-        } else if (mid_x > page_width / 2 + column_gap / 2) {
-            try right_lines.append(allocator, line);
-        } else {
-            try left_lines.append(allocator, line);
-        }
-    }
-
-    if (left_lines.items.len > 0) {
+    // Build column structure
+    var columns = try std.ArrayList(TextColumn).initCapacity(allocator, 1);
+    if (lines.items.len > 0) {
+        const all_lines = try allocator.dupe(TextLine, lines.items);
         try columns.append(allocator, .{
-            .bounds = mergeBounds(left_lines.items),
-            .lines = try left_lines.toOwnedSlice(allocator),
+            .bounds = mergeBounds(all_lines),
+            .lines = all_lines,
             .index = 0,
         });
     }
-    if (right_lines.items.len > 0) {
-        try columns.append(allocator, .{
-            .bounds = mergeBounds(right_lines.items),
-            .lines = try right_lines.toOwnedSlice(allocator),
-            .index = 1,
-        });
+
+    const order = try allocator.alloc(u32, columns.items.len);
+    for (order, 0..) |*o, i| {
+        o.* = @intCast(i);
     }
 
-    // Reading order: left column first, then right
-    var order: std.ArrayList(u32) = .empty;
-    for (columns.items, 0..) |_, i| {
-        try order.append(allocator, @intCast(i));
-    }
-
-    // Detect paragraphs within columns
-    var paragraphs: std.ArrayList(TextParagraph) = .empty;
+    // Detect paragraphs
+    var paragraphs = try std.ArrayList(TextParagraph).initCapacity(allocator, columns.items.len * 3);
     for (columns.items, 0..) |col, col_idx| {
         try detectParagraphs(allocator, col.lines, @intCast(col_idx), &paragraphs);
     }
 
+    const final_spans = try result_spans.toOwnedSlice(allocator);
+
     return LayoutResult{
-        .spans = sorted,
+        .spans = final_spans,
         .lines = try lines.toOwnedSlice(allocator),
         .columns = try columns.toOwnedSlice(allocator),
         .paragraphs = try paragraphs.toOwnedSlice(allocator),
-        .reading_order = try order.toOwnedSlice(allocator),
+        .reading_order = order,
         .allocator = allocator,
     };
 }
@@ -182,7 +321,7 @@ pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page
 fn detectParagraphs(allocator: std.mem.Allocator, col_lines: []const TextLine, col_idx: u32, paragraphs: *std.ArrayList(TextParagraph)) !void {
     if (col_lines.len == 0) return;
 
-    var para_lines: std.ArrayList(TextLine) = .empty;
+    var para_lines = try std.ArrayList(TextLine).initCapacity(allocator, @min(col_lines.len, 20));
     defer para_lines.deinit(allocator);
 
     var avg_line_spacing: f64 = 0;
@@ -249,8 +388,10 @@ fn detectParagraphs(allocator: std.mem.Allocator, col_lines: []const TextLine, c
 }
 
 fn makeLine(allocator: std.mem.Allocator, spans: []const TextSpan) !TextLine {
-    var words: std.ArrayList(TextWord) = .empty;
-    var current_word_spans: std.ArrayList(TextSpan) = .empty;
+    // Estimate words as ~1 per 2-3 spans
+    const estimated_words = @max(1, spans.len / 2);
+    var words = try std.ArrayList(TextWord).initCapacity(allocator, estimated_words);
+    var current_word_spans = try std.ArrayList(TextSpan).initCapacity(allocator, 8);
     const word_gap: f64 = 5;
 
     var prev_x1: f64 = spans[0].x0;
