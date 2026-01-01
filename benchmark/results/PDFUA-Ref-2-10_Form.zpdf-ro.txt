@@ -1,9 +1,0 @@
-PDF/UA form example
-From content
-Text, required:   ext, digets:  
- 
-T
-Check boxes: 
- A      B      C      DRadio buttons: 
- 
- yes     Drop-down:  no 

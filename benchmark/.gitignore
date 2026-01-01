@@ -1,0 +1,7 @@
+# Benchmark results
+results/
+*.txt
+
+# Test corpora (download separately)
+verapdf/
+*.pdf
