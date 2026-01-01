@@ -115,16 +115,20 @@ PYTHONPATH=python python3 examples/basic.py
 ```
 src/
 ├── root.zig         # Document API and core types
+├── main.zig         # CLI entry point
 ├── capi.zig         # C ABI exports for FFI
+├── wapi.zig         # WASM API exports
 ├── parser.zig       # PDF object parser
 ├── xref.zig         # XRef table/stream parsing
 ├── pagetree.zig     # Page tree resolution
 ├── decompress.zig   # Stream decompression filters
 ├── encoding.zig     # Font encoding and CMap parsing
+├── agl.zig          # Adobe Glyph List mappings
+├── cff.zig          # CFF/Type1 font parsing
 ├── interpreter.zig  # Content stream interpreter
 ├── structtree.zig   # Structure tree parser (PDF/UA)
-├── simd.zig         # SIMD string operations
-└── main.zig         # CLI
+├── layout.zig       # Text layout and bounding boxes
+└── simd.zig         # SIMD-accelerated parsing
 
 python/zpdf/         # Python bindings (cffi)
 examples/            # Usage examples
