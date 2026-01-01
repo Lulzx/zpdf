@@ -37,7 +37,7 @@ def find_pdfs():
     return list(CORPUS_DIR.rglob("*.pdf"))
 
 def extract_zpdf(pdf_path):
-    """Extract text using zpdf Python bindings."""
+    """Extract text using zpdf Python bindings (reading order by default)."""
     if not HAS_ZPDF:
         return ""
     try:

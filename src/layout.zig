@@ -122,6 +122,83 @@ pub const LayoutResult = struct {
     }
 };
 
+/// Simple geometric sort: Y (top to bottom), then X (left to right)
+/// Matches PyMuPDF's sort=True behavior
+pub fn sortGeometric(allocator: std.mem.Allocator, spans: []const TextSpan) ![]u8 {
+    if (spans.len == 0) return try allocator.alloc(u8, 0);
+
+    // Sort by Y descending (top to bottom in PDF coords), then X ascending
+    const sorted = try allocator.alloc(TextSpan, spans.len);
+    defer allocator.free(sorted);
+    @memcpy(sorted, spans);
+
+    const line_threshold: f64 = 3; // Tight threshold to match PyMuPDF
+
+    std.mem.sort(TextSpan, sorted, line_threshold, struct {
+        fn cmp(threshold: f64, a: TextSpan, b: TextSpan) bool {
+            // Group into rows by Y coordinate
+            const a_row = @as(i64, @intFromFloat(a.y0 / threshold));
+            const b_row = @as(i64, @intFromFloat(b.y0 / threshold));
+            if (a_row != b_row) return a_row > b_row; // Higher Y first (top of page)
+            return a.x0 < b.x0; // Left to right within row
+        }
+    }.cmp);
+
+    // Build output text
+    var total_len: usize = 0;
+    var separator_count: usize = 0;
+    var prev_y: f64 = sorted[0].y0;
+    var prev_x1: f64 = sorted[0].x0;
+    var prev_font_size: f64 = sorted[0].font_size;
+
+    for (sorted, 0..) |span, i| {
+        if (i > 0) {
+            if (@abs(span.y0 - prev_y) > line_threshold) {
+                separator_count += 1; // newline
+                prev_y = span.y0;
+            } else {
+                const space_width = prev_font_size * 0.2;
+                const gap = span.x0 - prev_x1;
+                if (gap > space_width) {
+                    separator_count += 1; // space
+                }
+            }
+        }
+        total_len += span.text.len;
+        prev_x1 = span.x1;
+        prev_font_size = span.font_size;
+    }
+
+    const result = try allocator.alloc(u8, total_len + separator_count);
+    var pos: usize = 0;
+    prev_y = sorted[0].y0;
+    prev_x1 = sorted[0].x0;
+    prev_font_size = sorted[0].font_size;
+
+    for (sorted, 0..) |span, i| {
+        if (i > 0) {
+            if (@abs(span.y0 - prev_y) > line_threshold) {
+                result[pos] = '\n';
+                pos += 1;
+                prev_y = span.y0;
+            } else {
+                const space_width = prev_font_size * 0.2;
+                const gap = span.x0 - prev_x1;
+                if (gap > space_width) {
+                    result[pos] = ' ';
+                    pos += 1;
+                }
+            }
+        }
+        @memcpy(result[pos..][0..span.text.len], span.text);
+        pos += span.text.len;
+        prev_x1 = span.x1;
+        prev_font_size = span.font_size;
+    }
+
+    return result[0..pos];
+}
+
 pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page_width: f64) !LayoutResult {
     if (spans.len == 0) {
         return LayoutResult{

@@ -543,11 +543,8 @@ fn ensurePageFonts(self: *Document, page_idx: usize) void {
     }
 
     /// Extract text using geometric sorting (fallback when no structure tree)
-    /// Sorts text by Y (top to bottom), then X (left to right), with two-column detection
+    /// Simple Y→X sort to match PyMuPDF's sort=True behavior
     fn extractTextGeometric(self: *Document, page_num: usize, allocator: std.mem.Allocator) ![]u8 {
-        const page = self.pages.items[page_num];
-        const page_width = page.media_box[2] - page.media_box[0];
-
         const spans = self.extractTextWithBounds(page_num, allocator) catch |err| {
             // If bounds extraction fails, fall back to stream order
             if (err == error.OutOfMemory) return err;
@@ -560,12 +557,9 @@ fn ensurePageFonts(self: *Document, page_idx: usize) void {
         }
         defer allocator.free(spans);
 
-        var layout_result = layout.analyzeLayout(allocator, spans, page_width) catch {
+        return layout.sortGeometric(allocator, spans) catch {
             return self.extractTextStreamOrder(page_num, allocator);
         };
-        defer layout_result.deinit();
-
-        return layout_result.getTextInOrder(allocator);
     }
 
     /// Extract text in raw stream order (last resort fallback)

@@ -130,28 +130,15 @@ class Document:
         finally:
             lib.zpdf_free_buffer(buf_ptr, out_len[0])
 
-    def extract_all(self, parallel: bool = True, reading_order: bool = False) -> str:
-        """Extract text from all pages.
+    def extract_all(self) -> str:
+        """Extract text from all pages in reading order.
 
-        Args:
-            parallel: If True (default), use multi-threaded extraction for speed.
-            reading_order: If True, returns text in visual reading order
-                          (left-to-right, top-to-bottom with column detection).
-                          If False (default), returns text in PDF stream order.
+        Uses structure tree when available, falls back to geometric sorting (Y→X).
         """
         self._check_open()
         out_len = ffi.new("size_t*")
 
-        if reading_order:
-            if parallel:
-                buf_ptr = lib.zpdf_extract_all_reading_order_parallel(self._handle, out_len)
-            else:
-                buf_ptr = lib.zpdf_extract_all_reading_order(self._handle, out_len)
-        else:
-            if parallel:
-                buf_ptr = lib.zpdf_extract_all_parallel(self._handle, out_len)
-            else:
-                buf_ptr = lib.zpdf_extract_all(self._handle, out_len)
+        buf_ptr = lib.zpdf_extract_all_reading_order(self._handle, out_len)
 
         if buf_ptr == ffi.NULL:
             if out_len[0] == 0:
