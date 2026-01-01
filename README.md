@@ -30,11 +30,11 @@ Peak throughput: **23,137 pages/sec** (Intel SDM)
 
 ### Accuracy
 
-All tools achieve ~99%+ character accuracy vs MuPDF reference:
+Character accuracy vs MuPDF reference (stream order extraction):
 
 | Tool | Char Accuracy | WER |
 |------|---------------|-----|
-| zpdf | 99.3-99.9% | 1-8% |
+| zpdf | 99.6-99.9% | 1-3% |
 | pdfium | 99.2-100% | 0-4% |
 | MuPDF | 100% (ref) | 0% |
 
@@ -146,7 +146,7 @@ examples/            # Usage examples
 | Word bounding boxes | Yes | Yes | Yes |
 | **Font Support** | | | |
 | WinAnsi/MacRoman | Yes | Yes | Yes |
-| ToUnicode CMap | Partial* | Yes | Yes |
+| ToUnicode CMap | Yes | Yes | Yes |
 | CID fonts (Type0) | Partial* | Yes | Yes |
 | **Compression** | | | |
 | FlateDecode, LZW, ASCII85/Hex | Yes | Yes | Yes |
@@ -156,7 +156,7 @@ examples/            # Usage examples
 | Rendering | No | Yes | Yes |
 | Multi-threaded | Yes | No** | No |
 
-*\*ToUnicode/CID: Works when CMap is embedded directly.*
+*\*CID fonts: Works when CMap is embedded directly.*
 *\*\*pdfium requires multi-process for parallelism (forked before thread support).*
 
 **Use zpdf when:** Batch processing, simple text extraction, Zig integration.

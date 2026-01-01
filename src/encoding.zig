@@ -167,6 +167,8 @@ pub const FontEncoding = struct {
     cmap_ranges: []const CMapRange,
     /// Fast lookup hash map for individual CMap entries (bfchar)
     cmap_hash: std.AutoHashMapUnmanaged(u32, u32),
+    /// Multi-character ToUnicode mappings (for ligatures like fi, fl, ffi, ffl)
+    cmap_multi: std.AutoHashMapUnmanaged(u32, []const u8),
     /// Is this a simple 8-bit encoding or complex CID encoding?
     is_cid: bool,
     /// Bytes per character (1 for simple, 1-4 for CID)
@@ -198,6 +200,7 @@ pub const FontEncoding = struct {
             .codepoint_map = undefined,
             .cmap_ranges = &.{},
             .cmap_hash = .{},
+            .cmap_multi = .{},
             .is_cid = false,
             .bytes_per_char = 1,
             .metrics = .{},
@@ -218,6 +221,12 @@ pub const FontEncoding = struct {
             self.allocator.free(self.cmap_ranges);
         }
         self.cmap_hash.deinit(self.allocator);
+        // Free multi-character mapping strings
+        var it = self.cmap_multi.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.cmap_multi.deinit(self.allocator);
         self.widths.deinit();
         // Free CIDToGIDMap stream data if present
         switch (self.cid_to_gid_map.mapping) {
@@ -245,6 +254,12 @@ pub const FontEncoding = struct {
 
     fn decodeSimple(self: *const FontEncoding, data: []const u8, writer: anytype) !void {
         for (data) |byte| {
+            // Check for multi-character mapping first (ligatures)
+            if (self.cmap_multi.get(byte)) |utf8_str| {
+                try writer.writeAll(utf8_str);
+                continue;
+            }
+
             const codepoint = self.codepoint_map[byte];
             if (codepoint == 0) {
                 // No mapping - output replacement character or space
@@ -268,6 +283,12 @@ pub const FontEncoding = struct {
             };
 
             i += code.bytes_consumed;
+
+            // Check for multi-character mapping first (ligatures)
+            if (self.cmap_multi.get(code.value)) |utf8_str| {
+                try writer.writeAll(utf8_str);
+                continue;
+            }
 
             // Look up in CMap ranges first
             var codepoint = self.lookupCMap(code.value);
@@ -857,19 +878,34 @@ fn parseBfChar(allocator: std.mem.Allocator, data: []const u8, pos: *usize, _: *
 
         skipWhitespace(data, pos);
 
-        // Parse destination: <XXXX> (Unicode)
-        const dst = parseHexToken(data, pos) orelse {
+        // Parse destination: <XXXX> (Unicode) - can be multi-byte for ligatures
+        var dst_buf: [16]u8 = undefined;
+        const dst_result = parseHexTokenRaw(data, pos, &dst_buf) orelse {
             skipToNextEntry(data, pos);
             continue;
         };
 
-        // For simple 1-byte codes, update the direct map
-        if (src <= 255 and dst <= 0x10FFFF) {
-            encoding.codepoint_map[@intCast(src)] = @intCast(dst);
-        }
+        // Check if this is a multi-character mapping (> 2 bytes = multiple UTF-16BE code units)
+        if (dst_result.byte_count > 2) {
+            // Multi-character mapping (ligatures like fi, fl, ffi, ffl)
+            // Convert UTF-16BE to UTF-8 and store in cmap_multi
+            const utf8_str = utf16beToUtf8(allocator, dst_buf[0..dst_result.byte_count]) catch continue;
+            try encoding.cmap_multi.put(allocator, src, utf8_str);
+        } else {
+            // Single character mapping
+            var dst: u32 = 0;
+            for (dst_buf[0..dst_result.byte_count]) |b| {
+                dst = (dst << 8) | b;
+            }
 
-        // Add to hash map for O(1) lookup
-        try encoding.cmap_hash.put(allocator, src, dst);
+            // For simple 1-byte codes, update the direct map
+            if (src <= 255 and dst <= 0x10FFFF) {
+                encoding.codepoint_map[@intCast(src)] = @intCast(dst);
+            }
+
+            // Add to hash map for O(1) lookup
+            try encoding.cmap_hash.put(allocator, src, dst);
+        }
     }
 }
 
@@ -956,6 +992,96 @@ fn parseHexToken(data: []const u8, pos: *usize) ?u32 {
     }
 
     return value;
+}
+
+/// Parse a hex token and return the raw bytes plus the byte count
+/// Returns null if no valid hex token found
+fn parseHexTokenRaw(data: []const u8, pos: *usize, out_buf: *[16]u8) ?struct { byte_count: usize } {
+    if (pos.* >= data.len or data[pos.*] != '<') return null;
+    pos.* += 1;
+
+    var byte_count: usize = 0;
+    var nibble_count: usize = 0;
+    var current_byte: u8 = 0;
+
+    while (pos.* < data.len and data[pos.*] != '>') {
+        const c = data[pos.*];
+        pos.* += 1;
+
+        const nibble: u4 = if (c >= '0' and c <= '9')
+            @truncate(c - '0')
+        else if (c >= 'A' and c <= 'F')
+            @truncate(c - 'A' + 10)
+        else if (c >= 'a' and c <= 'f')
+            @truncate(c - 'a' + 10)
+        else
+            continue;
+
+        if (nibble_count % 2 == 0) {
+            current_byte = @as(u8, nibble) << 4;
+        } else {
+            current_byte |= nibble;
+            if (byte_count < out_buf.len) {
+                out_buf[byte_count] = current_byte;
+                byte_count += 1;
+            }
+        }
+        nibble_count += 1;
+    }
+
+    // Handle odd nibble count (implicit trailing 0)
+    if (nibble_count % 2 == 1 and byte_count < out_buf.len) {
+        out_buf[byte_count] = current_byte;
+        byte_count += 1;
+    }
+
+    if (pos.* < data.len and data[pos.*] == '>') {
+        pos.* += 1;
+    }
+
+    return .{ .byte_count = byte_count };
+}
+
+/// Decode UTF-16BE bytes to UTF-8
+fn utf16beToUtf8(allocator: std.mem.Allocator, utf16_bytes: []const u8) ![]u8 {
+    var utf8_list: std.ArrayList(u8) = .empty;
+    errdefer utf8_list.deinit(allocator);
+
+    var i: usize = 0;
+    while (i + 1 < utf16_bytes.len) {
+        const code_unit: u16 = (@as(u16, utf16_bytes[i]) << 8) | utf16_bytes[i + 1];
+        i += 2;
+
+        var codepoint: u21 = undefined;
+
+        // Check for surrogate pairs
+        if (code_unit >= 0xD800 and code_unit <= 0xDBFF) {
+            // High surrogate - read low surrogate
+            if (i + 1 < utf16_bytes.len) {
+                const low: u16 = (@as(u16, utf16_bytes[i]) << 8) | utf16_bytes[i + 1];
+                if (low >= 0xDC00 and low <= 0xDFFF) {
+                    codepoint = 0x10000 + (@as(u21, code_unit - 0xD800) << 10) + (low - 0xDC00);
+                    i += 2;
+                } else {
+                    codepoint = 0xFFFD; // Replacement character
+                }
+            } else {
+                codepoint = 0xFFFD;
+            }
+        } else if (code_unit >= 0xDC00 and code_unit <= 0xDFFF) {
+            // Orphan low surrogate
+            codepoint = 0xFFFD;
+        } else {
+            codepoint = code_unit;
+        }
+
+        // Encode to UTF-8
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(codepoint, &buf) catch 1;
+        try utf8_list.appendSlice(allocator, buf[0..len]);
+    }
+
+    return utf8_list.toOwnedSlice(allocator);
 }
 
 fn skipWhitespace(data: []const u8, pos: *usize) void {
