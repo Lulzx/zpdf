@@ -11,6 +11,7 @@ A PDF text extraction library written in Zig.
 - XRef table and stream parsing (PDF 1.5+)
 - Configurable error handling (strict or permissive)
 - Multi-threaded parallel page extraction
+- Structure tree extraction for tagged PDFs (PDF/UA)
 
 ## Benchmark
 
@@ -84,6 +85,7 @@ pub fn main() !void {
 zpdf extract document.pdf              # Extract all pages to stdout
 zpdf extract -p 1-10 document.pdf      # Extract pages 1-10
 zpdf extract -o out.txt document.pdf   # Output to file
+zpdf extract --tagged doc.pdf          # Use structure tree order (for tagged PDFs)
 zpdf extract --reading-order doc.pdf   # Use visual reading order (experimental)
 zpdf info document.pdf                 # Show document info
 zpdf bench document.pdf                # Run benchmark
@@ -129,6 +131,7 @@ src/
 ├── decompress.zig   # Stream decompression filters
 ├── encoding.zig     # Font encoding and CMap parsing
 ├── interpreter.zig  # Content stream interpreter
+├── structtree.zig   # Structure tree parser (PDF/UA)
 ├── simd.zig         # SIMD string operations
 └── main.zig         # CLI
 
@@ -142,7 +145,8 @@ examples/            # Usage examples
 |---------|------|--------|-------|
 | **Text Extraction** | | | |
 | Stream order | Yes | Yes | Yes |
-| Reading order | Experimental | No | Yes |
+| Tagged/structure tree | Yes | No | Yes |
+| Visual reading order | Experimental | No | Yes |
 | Word bounding boxes | Yes | Yes | Yes |
 | **Font Support** | | | |
 | WinAnsi/MacRoman | Yes | Yes | Yes |
@@ -159,11 +163,11 @@ examples/            # Usage examples
 *\*CID fonts: Works when CMap is embedded directly.*
 *\*\*pdfium requires multi-process for parallelism (forked before thread support).*
 
-**Use zpdf when:** Batch processing, simple text extraction, Zig integration.
+**Use zpdf when:** Batch processing, tagged PDFs (PDF/UA), simple text extraction, Zig integration.
 
 **Use pdfium when:** Browser integration, full PDF support, proven stability.
 
-**Use MuPDF when:** Reading order matters, complex layouts, rendering needed.
+**Use MuPDF when:** Complex visual layouts, rendering needed.
 
 ## License
 

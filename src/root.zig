@@ -23,6 +23,7 @@ pub const interpreter = @import("interpreter.zig");
 pub const decompress = @import("decompress.zig");
 pub const simd = @import("simd.zig");
 pub const layout = @import("layout.zig");
+pub const structtree = @import("structtree.zig");
 
 // Re-exports
 pub const Object = parser.Object;
@@ -32,6 +33,8 @@ pub const Page = pagetree.Page;
 pub const FontEncoding = encoding.FontEncoding;
 pub const TextSpan = layout.TextSpan;
 pub const LayoutResult = layout.LayoutResult;
+pub const StructTree = structtree.StructTree;
+pub const StructElement = structtree.StructElement;
 
 /// Error handling configuration
 pub const ErrorConfig = struct {
@@ -430,6 +433,145 @@ fn ensurePageFonts(self: *Document, page_idx: usize) void {
         return layout.analyzeLayout(allocator, spans, page_width);
     }
 
+    /// Check if the document has a structure tree (is tagged)
+    pub fn hasStructureTree(self: *Document) bool {
+        const arena = self.parsing_arena.allocator();
+
+        // Get Root from trailer
+        const root_ref = switch (self.xref_table.trailer.get("Root") orelse return false) {
+            .reference => |r| r,
+            else => return false,
+        };
+
+        const catalog = pagetree.resolveRef(arena, self.data, &self.xref_table, root_ref, &self.object_cache) catch return false;
+
+        const catalog_dict = switch (catalog) {
+            .dict => |d| d,
+            else => return false,
+        };
+
+        return catalog_dict.get("StructTreeRoot") != null;
+    }
+
+    /// Extract text using structure tree reading order (for tagged PDFs)
+    /// Falls back to stream order if no structure tree is present
+    pub fn extractTextStructured(self: *Document, page_num: usize, allocator: std.mem.Allocator) ![]u8 {
+        if (page_num >= self.pages.items.len) return error.PageNotFound;
+
+        const arena = self.parsing_arena.allocator();
+        const page = self.pages.items[page_num];
+
+        // Get content stream
+        const content = pagetree.getPageContents(
+            arena,
+            self.data,
+            &self.xref_table,
+            page,
+            &self.object_cache,
+        ) catch return allocator.alloc(u8, 0);
+
+        if (content.len == 0) return allocator.alloc(u8, 0);
+
+        // Lazy-load fonts for this page
+        self.ensurePageFonts(page_num);
+
+        // Extract text with MCID tracking
+        var extractor = structtree.MarkedContentExtractor.init(allocator);
+        defer extractor.deinit();
+
+        try extractTextWithMcidTracking(arena, content, page_num, &self.font_cache, &extractor);
+
+        // Parse structure tree to get reading order
+        var tree = structtree.parseStructTree(arena, self.data, &self.xref_table, &self.object_cache) catch
+            return self.extractTextToBuffer(page_num, allocator);
+
+        defer tree.deinit();
+
+        if (tree.root == null) {
+            // No structure tree, fall back to stream order
+            return self.extractTextToBuffer(page_num, allocator);
+        }
+
+        // Build page index mapping (object number -> page index)
+        var page_obj_to_idx = std.AutoHashMap(u32, usize).init(allocator);
+        defer page_obj_to_idx.deinit();
+
+        for (self.pages.items, 0..) |p, idx| {
+            try page_obj_to_idx.put(p.ref.num, idx);
+        }
+
+        // Get reading order for this page
+        var reading_order = try tree.getReadingOrder(allocator);
+        defer {
+            var it = reading_order.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(allocator);
+            }
+            reading_order.deinit();
+        }
+
+        // Collect text in structure tree order
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+
+        // Find MCIDs for this page by checking object numbers
+        var it = reading_order.iterator();
+        while (it.next()) |entry| {
+            // Check if this object number matches our page
+            const obj_num = entry.key_ptr.*;
+            if (page_obj_to_idx.get(@intCast(obj_num))) |idx| {
+                if (idx == page_num) {
+                    for (entry.value_ptr.items) |mcr| {
+                        if (extractor.getTextForMcid(mcr.mcid)) |text| {
+                            if (result.items.len > 0 and text.len > 0) {
+                                try result.append(allocator, ' ');
+                            }
+                            try result.appendSlice(allocator, text);
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we got no content from structure tree, fall back to stream order
+        if (result.items.len == 0) {
+            result.deinit(allocator);
+            return self.extractTextToBuffer(page_num, allocator);
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Extract text to a buffer (helper for fallback)
+    fn extractTextToBuffer(self: *Document, page_num: usize, allocator: std.mem.Allocator) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+
+        const arena = self.parsing_arena.allocator();
+        const page = self.pages.items[page_num];
+        const content = pagetree.getPageContents(arena, self.data, &self.xref_table, page, &self.object_cache) catch return output.toOwnedSlice(allocator);
+
+        self.ensurePageFonts(page_num);
+        try extractTextFromContent(arena, content, page_num, &self.font_cache, output.writer(allocator));
+        return output.toOwnedSlice(allocator);
+    }
+
+    /// Extract text from all pages using structure tree order
+    pub fn extractAllTextStructured(self: *Document, allocator: std.mem.Allocator) ![]u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+
+        for (0..self.pages.items.len) |i| {
+            if (i > 0) try result.append(allocator, '\x0c'); // Form feed
+
+            const page_text = try self.extractTextStructured(i, allocator);
+            defer allocator.free(page_text);
+            try result.appendSlice(allocator, page_text);
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
     /// Extract text from all pages in parallel (returns concatenated result)
     /// Only available on non-WASM targets (use extractAllText on WASM)
     pub const extractAllTextParallel = if (is_wasm)
@@ -801,6 +943,239 @@ fn writeTJArrayToCollector(operand: interpreter.Operand, font: ?*const encoding.
         }
     }
 }
+
+/// Extract text with MCID tracking for structure-tree-based reading order
+fn extractTextWithMcidTracking(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    page_num: usize,
+    font_cache: *const std.StringHashMap(encoding.FontEncoding),
+    extractor: *structtree.MarkedContentExtractor,
+) !void {
+    var lexer = interpreter.ContentLexer.init(allocator, content);
+    var operands: [64]interpreter.Operand = undefined;
+    var operand_count: usize = 0;
+
+    var current_font: ?*const encoding.FontEncoding = null;
+    var font_size: f64 = 12;
+
+    // Buffer for font cache key lookup
+    var key_buf: [64]u8 = undefined;
+
+    // Text buffer for current extraction
+    var text_buf: [4096]u8 = undefined;
+    var text_pos: usize = 0;
+
+    while (try lexer.next()) |token| {
+        switch (token) {
+            .number => |n| {
+                if (operand_count < 64) {
+                    operands[operand_count] = .{ .number = n };
+                    operand_count += 1;
+                }
+            },
+            .string => |s| {
+                if (operand_count < 64) {
+                    operands[operand_count] = .{ .string = s };
+                    operand_count += 1;
+                }
+            },
+            .hex_string => |s| {
+                if (operand_count < 64) {
+                    operands[operand_count] = .{ .hex_string = s };
+                    operand_count += 1;
+                }
+            },
+            .name => |n| {
+                if (operand_count < 64) {
+                    operands[operand_count] = .{ .name = n };
+                    operand_count += 1;
+                }
+            },
+            .array => |arr| {
+                if (operand_count < 64) {
+                    operands[operand_count] = .{ .array = arr };
+                    operand_count += 1;
+                }
+            },
+            .operator => |op| {
+                if (op.len > 0) switch (op[0]) {
+                    'B' => {
+                        if (std.mem.eql(u8, op, "BDC")) {
+                            // Begin marked content with dictionary: /Tag <<...>> BDC
+                            // or /Tag <</MCID n>> BDC
+                            if (operand_count >= 2) {
+                                const tag = operands[0].asName() orelse "Unknown";
+                                const mcid = extractMcidFromDict(operands[1]);
+                                try extractor.beginMarkedContent(tag, mcid);
+                            }
+                        } else if (std.mem.eql(u8, op, "BMC")) {
+                            // Begin marked content: /Tag BMC
+                            if (operand_count >= 1) {
+                                const tag = operands[0].asName() orelse "Unknown";
+                                try extractor.beginMarkedContent(tag, null);
+                            }
+                        }
+                    },
+                    'E' => {
+                        if (std.mem.eql(u8, op, "EMC")) {
+                            extractor.endMarkedContent();
+                        }
+                    },
+                    'T' => if (op.len == 2) switch (op[1]) {
+                        'f' => if (operand_count >= 2) {
+                            if (operands[0] == .name) {
+                                const font_name = operands[0].name;
+                                const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_num, font_name }) catch "";
+                                current_font = font_cache.getPtr(key);
+                            }
+                            font_size = operands[1].number;
+                        },
+                        'j' => if (operand_count >= 1) {
+                            text_pos = 0;
+                            writeTextToBuffer(operands[0], current_font, &text_buf, &text_pos);
+                            if (text_pos > 0) {
+                                try extractor.addText(text_buf[0..text_pos]);
+                            }
+                        },
+                        'J' => if (operand_count >= 1) {
+                            text_pos = 0;
+                            writeTJArrayToBuffer(operands[0], current_font, &text_buf, &text_pos);
+                            if (text_pos > 0) {
+                                try extractor.addText(text_buf[0..text_pos]);
+                            }
+                        },
+                        else => {},
+                    },
+                    '\'' => if (operand_count >= 1) {
+                        text_pos = 0;
+                        writeTextToBuffer(operands[0], current_font, &text_buf, &text_pos);
+                        if (text_pos > 0) {
+                            try extractor.addText(text_buf[0..text_pos]);
+                        }
+                    },
+                    '"' => if (operand_count >= 3) {
+                        text_pos = 0;
+                        writeTextToBuffer(operands[2], current_font, &text_buf, &text_pos);
+                        if (text_pos > 0) {
+                            try extractor.addText(text_buf[0..text_pos]);
+                        }
+                    },
+                    else => {},
+                };
+                operand_count = 0;
+            },
+        }
+    }
+}
+
+/// Extract MCID from a dictionary operand (for BDC)
+fn extractMcidFromDict(operand: interpreter.Operand) ?i32 {
+    // The operand could be a dict-like structure in the operand stack
+    // In content streams, BDC is typically: /Tag <</MCID n>> BDC
+    // The lexer doesn't parse inline dicts, so we need to check the raw array
+    switch (operand) {
+        .array => |arr| {
+            // Look for /MCID followed by a number
+            var i: usize = 0;
+            while (i + 1 < arr.len) : (i += 1) {
+                if (arr[i] == .name and std.mem.eql(u8, arr[i].name, "MCID")) {
+                    if (arr[i + 1] == .number) {
+                        return @intFromFloat(arr[i + 1].number);
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// Write text to a buffer (for MCID tracking)
+fn writeTextToBuffer(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, buf: []u8, pos: *usize) void {
+    const data = switch (operand) {
+        .string => |s| s,
+        .hex_string => |s| s,
+        else => return,
+    };
+
+    if (font) |enc| {
+        // Create a buffer writer
+        var writer = BufferWriter{ .buf = buf, .pos = pos };
+        enc.decode(data, &writer) catch {};
+    } else {
+        // Fallback to simple decoding
+        for (data) |byte| {
+            if (pos.* >= buf.len) break;
+            if (byte >= 32 and byte < 127) {
+                buf[pos.*] = byte;
+                pos.* += 1;
+            } else if (byte != 0) {
+                const codepoint = encoding.win_ansi_encoding[byte];
+                if (codepoint != 0 and codepoint < 128) {
+                    buf[pos.*] = @truncate(codepoint);
+                    pos.* += 1;
+                } else if (codepoint != 0) {
+                    var utf8_buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch continue;
+                    for (utf8_buf[0..len]) |c| {
+                        if (pos.* >= buf.len) break;
+                        buf[pos.*] = c;
+                        pos.* += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Write TJ array to buffer
+fn writeTJArrayToBuffer(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, buf: []u8, pos: *usize) void {
+    const arr = switch (operand) {
+        .array => |a| a,
+        else => return,
+    };
+
+    for (arr) |item| {
+        switch (item) {
+            .string, .hex_string => writeTextToBuffer(item, font, buf, pos),
+            .number => |n| {
+                if (n < -100 and pos.* < buf.len) {
+                    buf[pos.*] = ' ';
+                    pos.* += 1;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Simple buffer writer for font decoding
+const BufferWriter = struct {
+    buf: []u8,
+    pos: *usize,
+
+    pub fn writeAll(self: *BufferWriter, data: []const u8) !void {
+        for (data) |c| {
+            if (self.pos.* >= self.buf.len) break;
+            self.buf[self.pos.*] = c;
+            self.pos.* += 1;
+        }
+    }
+
+    pub fn writeByte(self: *BufferWriter, byte: u8) !void {
+        if (self.pos.* < self.buf.len) {
+            self.buf[self.pos.*] = byte;
+            self.pos.* += 1;
+        }
+    }
+
+    pub fn print(self: *BufferWriter, comptime fmt: []const u8, args: anytype) !void {
+        _ = fmt;
+        _ = args;
+        _ = self;
+    }
+};
 
 // ============================================================================
 // CONVENIENCE FUNCTIONS

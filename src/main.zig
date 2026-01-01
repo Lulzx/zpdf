@@ -58,7 +58,9 @@ fn printUsage() !void {
         \\  -o FILE         Output to file (default: stdout)
         \\  -p PAGES        Page range (e.g., "1-10" or "1,3,5")
         \\  --sequential    Disable parallel extraction
-        \\  --reading-order Use visual reading order (experimental, slower)
+        \\  --stream-order  Use content stream order (default, fastest)
+        \\  --reading-order Use visual reading order (slower)
+        \\  --tagged        Use structure tree for reading order (for tagged PDFs)
         \\  --strict        Fail on any parse error
         \\  --permissive    Continue past all errors
         \\  --json          Output as JSON with positions
@@ -67,10 +69,17 @@ fn printUsage() !void {
         \\  zpdf extract document.pdf              # All pages to stdout
         \\  zpdf extract -o out.txt document.pdf   # All pages to file
         \\  zpdf extract -p 1-10 document.pdf      # First 10 pages
+        \\  zpdf extract --tagged document.pdf     # Use PDF structure tree
         \\  zpdf bench document.pdf                # Benchmark vs mutool
         \\
     );
 }
+
+const ExtractionMode = enum {
+    stream, // Default: extract in content stream order
+    visual, // Use visual layout analysis for reading order
+    tagged, // Use structure tree (tagged PDF) for reading order
+};
 
 fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var input_file: ?[]const u8 = null;
@@ -79,7 +88,7 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var error_mode: zpdf.ErrorConfig = zpdf.ErrorConfig.default();
     var json_output = false;
     var sequential = false;
-    var stream_order = true; // Default to stream order (faster, higher accuracy)
+    var extraction_mode: ExtractionMode = .stream;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -100,9 +109,11 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--sequential")) {
             sequential = true;
         } else if (std.mem.eql(u8, arg, "--stream-order")) {
-            stream_order = true;
+            extraction_mode = .stream;
         } else if (std.mem.eql(u8, arg, "--reading-order")) {
-            stream_order = false;
+            extraction_mode = .visual;
+        } else if (std.mem.eql(u8, arg, "--tagged") or std.mem.eql(u8, arg, "--struct-order")) {
+            extraction_mode = .tagged;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             input_file = arg;
         }
@@ -137,26 +148,37 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer allocator.free(pages);
 
-    // Use parallel extraction by default for all pages (non-JSON mode)
-    // Note: parallel reading-order extraction has race condition in object cache,
-    // so we only use parallel for stream order extraction
-    const use_parallel = !sequential and !json_output and page_range == null and stream_order;
+    // Use parallel extraction by default for all pages (non-JSON mode, stream order only)
+    const use_parallel = !sequential and !json_output and page_range == null and extraction_mode == .stream;
 
     // Use buffered output
     var write_buf: [4096]u8 = undefined;
 
     if (use_parallel) {
-        // Parallel extraction - get all text at once
-        const result = if (stream_order)
-            doc.extractAllTextParallel(allocator) catch |err| {
-                std.debug.print("Error during parallel extraction: {}\n", .{err});
-                return;
-            }
-        else
-            extractAllTextReadingOrderParallel(doc, allocator) catch |err| {
-                std.debug.print("Error during parallel extraction: {}\n", .{err});
+        // Parallel extraction - get all text at once (stream order only)
+        const result = doc.extractAllTextParallel(allocator) catch |err| {
+            std.debug.print("Error during parallel extraction: {}\n", .{err});
+            return;
+        };
+        defer allocator.free(result);
+
+        if (output_handle) |h| {
+            h.writeAll(result) catch |err| {
+                std.debug.print("Error writing output: {}\n", .{err});
                 return;
             };
+        } else {
+            std.fs.File.stdout().writeAll(result) catch |err| {
+                std.debug.print("Error writing output: {}\n", .{err});
+                return;
+            };
+        }
+    } else if (extraction_mode == .tagged) {
+        // Structure tree (tagged PDF) extraction
+        const result = doc.extractAllTextStructured(allocator) catch |err| {
+            std.debug.print("Error during structured extraction: {}\n", .{err});
+            return;
+        };
         defer allocator.free(result);
 
         if (output_handle) |h| {
@@ -174,12 +196,12 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
         var file_writer = h.writer(&write_buf);
         const writer = &file_writer.interface;
         defer writer.flush() catch {};
-        try doExtract(doc, pages, json_output, stream_order, allocator, writer);
+        try doExtract(doc, pages, json_output, extraction_mode, allocator, writer);
     } else {
         var stdout_writer = std.fs.File.stdout().writer(&write_buf);
         const writer = &stdout_writer.interface;
         defer writer.flush() catch {};
-        try doExtract(doc, pages, json_output, stream_order, allocator, writer);
+        try doExtract(doc, pages, json_output, extraction_mode, allocator, writer);
     }
 
     // Report errors if any
@@ -198,7 +220,7 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 }
 
-fn doExtract(doc: *zpdf.Document, pages: []const usize, json_output: bool, stream_order: bool, allocator: std.mem.Allocator, writer: anytype) !void {
+fn doExtract(doc: *zpdf.Document, pages: []const usize, json_output: bool, extraction_mode: ExtractionMode, allocator: std.mem.Allocator, writer: anytype) !void {
     if (json_output) {
         try writer.writeAll("{\n  \"pages\": [\n");
     }
@@ -209,19 +231,31 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, json_output: bool, strea
             try writer.print("    {{\"page\": {}, \"text\": \"", .{page_num + 1});
         }
 
-        if (stream_order) {
-            doc.extractText(page_num, writer) catch |err| {
-                std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-                continue;
-            };
-        } else {
-            // Reading order extraction
-            const text = extractPageReadingOrder(doc, page_num, allocator) catch |err| {
-                std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-                continue;
-            };
-            defer allocator.free(text);
-            try writer.writeAll(text);
+        switch (extraction_mode) {
+            .stream => {
+                doc.extractText(page_num, writer) catch |err| {
+                    std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
+                    continue;
+                };
+            },
+            .visual => {
+                // Visual reading order extraction
+                const text = extractPageReadingOrder(doc, page_num, allocator) catch |err| {
+                    std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
+                    continue;
+                };
+                defer allocator.free(text);
+                try writer.writeAll(text);
+            },
+            .tagged => {
+                // Structure tree reading order
+                const text = doc.extractTextStructured(page_num, allocator) catch |err| {
+                    std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
+                    continue;
+                };
+                defer allocator.free(text);
+                try writer.writeAll(text);
+            },
         }
 
         if (json_output) {

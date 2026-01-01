@@ -470,14 +470,14 @@ pub const Operand = union(enum) {
     name: []const u8,
     array: []const Operand,
 
-    fn asNumber(self: Operand) f64 {
+    pub fn asNumber(self: Operand) f64 {
         return switch (self) {
             .number => |n| n,
             else => 0,
         };
     }
 
-    fn asName(self: Operand) ?[]const u8 {
+    pub fn asName(self: Operand) ?[]const u8 {
         return switch (self) {
             .name => |n| n,
             else => null,
