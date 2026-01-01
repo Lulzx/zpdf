@@ -21,9 +21,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: master
+        run: |
+          ZIG_URL=$(curl -s https://ziglang.org/download/index.json | jq -r '.master."x86_64-linux".tarball')
+          wget -q "$ZIG_URL"
+          tar xf zig-*.tar.xz
+          echo "$PWD"/zig-*/ >> $GITHUB_PATH
 
       - name: Build WASM
         run: zig build wasm
