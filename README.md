@@ -10,12 +10,12 @@ A PDF text extraction library written in Zig.
 - Font encoding support: WinAnsi, MacRoman, ToUnicode CMap
 - XRef table and stream parsing (PDF 1.5+)
 - Configurable error handling (strict or permissive)
-- Multi-threaded parallel page extraction
 - Structure tree extraction for tagged PDFs (PDF/UA)
+- Geometric sorting fallback for non-tagged PDFs
 
 ## Benchmark
 
-Text extraction performance on Apple M4 Pro (parallel, stream order):
+Text extraction performance on Apple M4 Pro:
 
 | Document | Pages | zpdf | pdfium | MuPDF |
 |----------|------:|-----:|-------:|------:|
@@ -49,8 +49,8 @@ Batch processing benchmark on [veraPDF test corpus](https://github.com/veraPDF/v
 
 | Tool | Time | PDFs/sec | Speedup |
 |------|------|----------|---------|
-| zpdf | **6.0s** | **487** | **5.7x** |
-| MuPDF | 34.0s | 85 | 1x |
+| zpdf | **0.5s** | **6,013** | **4.7x** |
+| PyMuPDF | 2.3s | 1,274 | 1x |
 
 ## Requirements
 
@@ -109,11 +109,8 @@ with zpdf.Document("file.pdf") as doc:
     # Single page
     text = doc.extract_page(0)
 
-    # All pages (parallel by default)
+    # All pages (reading order by default)
     all_text = doc.extract_all()
-
-    # Reading order extraction (experimental)
-    ordered_text = doc.extract_all(reading_order=True)
 
     # Page info
     info = doc.get_page_info(0)
@@ -148,17 +145,16 @@ examples/            # Usage examples
 
 ## Reading Order
 
-zpdf uses a two-tier approach for extracting text in logical reading order:
+zpdf extracts text in logical reading order using a two-tier approach:
 
-1. **Structure Tree** (preferred): Uses the PDF's semantic structure as defined by the document author. This is the correct approach for tagged/accessible PDFs (PDF/UA) and properly handles multi-column layouts, sidebars, tables, and captions.
+1. **Structure Tree** (preferred): Uses the PDF's semantic structure for tagged/accessible PDFs (PDF/UA). Correctly handles multi-column layouts, sidebars, tables, and captions.
 
-2. **Geometric Sorting** (fallback): When no structure tree exists, zpdf falls back to sorting text by Y-coordinate (top→bottom), then X-coordinate (left→right), with automatic two-column detection.
+2. **Geometric Sorting** (fallback): When no structure tree exists, sorts text by Y-coordinate (top→bottom), then X-coordinate (left→right).
 
 | Method | Pros | Cons |
 |--------|------|------|
 | Structure tree | Correct semantic order, handles complex layouts | Only works on tagged PDFs |
-| Geometric sort | Works on any PDF, handles two-column | Can fail on complex layouts |
-| Stream order | Fast, raw extraction | Often wrong order |
+| Geometric sort | Works on any PDF | May fail on complex layouts |
 
 ## Comparison
 
@@ -179,10 +175,8 @@ zpdf uses a two-tier approach for extracting text in logical reading order:
 | **Other** | | | |
 | Encrypted PDFs | No | Yes | Yes |
 | Rendering | No | Yes | Yes |
-| Multi-threaded | Yes | No** | No |
 
 *\*CID fonts: Works when CMap is embedded directly.*
-*\*\*pdfium requires multi-process for parallelism (forked before thread support).*
 
 **Use zpdf when:** Batch processing, tagged PDFs (PDF/UA), simple text extraction, Zig integration.
 
