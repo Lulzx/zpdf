@@ -16,3 +16,6 @@ __pycache__/
 # Test files
 test/
 *.pdf
+
+# WASM binary (built by CI)
+web/zpdf.wasm
