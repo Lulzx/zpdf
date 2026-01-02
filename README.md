@@ -164,4 +164,4 @@ zpdf extracts text in logical reading order using a two-tier approach:
 
 ## License
 
-WTFPL
+CC0 - Public Domain
