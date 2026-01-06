@@ -11,8 +11,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const native_os = builtin.os.tag;
 
 const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
+const is_windows = native_os == .windows;
 
 // Internal modules
 pub const parser = @import("parser.zig");
@@ -95,8 +97,10 @@ pub const ParseError = struct {
 pub const Document = struct {
     /// Memory-mapped file data (zero-copy base)
     data: []const u8,
-    /// Whether we own the data (mmap'd)
+    /// Whether we own the data (mmap'd or allocated)
     owns_data: bool,
+    /// Whether data was allocated (Windows) vs mmap'd (POSIX)
+    data_is_allocated: bool = false,
 
     /// Cross-reference table
     xref_table: XRefTable,
@@ -147,20 +151,30 @@ pub const Document = struct {
         const stat = try file.stat();
         const size = stat.size;
 
-        // Memory map the file
-        const data = try std.posix.mmap(
-            null,
-            size,
-            std.posix.PROT.READ,
-            .{ .TYPE = .PRIVATE },
-            file.handle,
-            0,
-        );
-
-        return openFromMemoryOwned(allocator, data, config);
+        if (comptime is_windows) {
+            // Windows: read file into allocated memory (no mmap support)
+            const data = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), size);
+            errdefer allocator.free(data);
+            const bytes_read = try file.readAll(data);
+            if (bytes_read != size) {
+                return error.UnexpectedEof;
+            }
+            return openFromMemoryOwnedAlloc(allocator, data, config);
+        } else {
+            // POSIX: memory map the file
+            const data = try std.posix.mmap(
+                null,
+                size,
+                std.posix.PROT.READ,
+                .{ .TYPE = .PRIVATE },
+                file.handle,
+                0,
+            );
+            return openFromMemoryOwned(allocator, data, config);
+        }
     }
 
-    /// Open from owned memory (will be freed on close)
+    /// Open from owned memory (will be freed on close via munmap)
     fn openFromMemoryOwned(allocator: std.mem.Allocator, data: []align(std.heap.page_size_min) u8, config: ErrorConfig) !*Document {
         if (comptime is_wasm) {
             @compileError("openFromMemoryOwned is not available on WASM. Use openFromMemory instead.");
@@ -172,6 +186,31 @@ pub const Document = struct {
         doc.* = .{
             .data = data,
             .owns_data = true,
+            .data_is_allocated = false,
+            .xref_table = XRefTable.init(allocator),
+            .pages = .empty,
+            .object_cache = std.AutoHashMap(u32, Object).init(allocator),
+            .allocator = allocator,
+            .parsing_arena = std.heap.ArenaAllocator.init(allocator),
+            .error_config = config,
+            .errors = .empty,
+            .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
+            .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
+        };
+
+        try doc.parseDocument();
+        return doc;
+    }
+
+    /// Open from owned allocated memory (Windows - will be freed on close via allocator.free)
+    fn openFromMemoryOwnedAlloc(allocator: std.mem.Allocator, data: []align(std.heap.page_size_min) u8, config: ErrorConfig) !*Document {
+        const doc = try allocator.create(Document);
+        errdefer allocator.destroy(doc);
+
+        doc.* = .{
+            .data = data,
+            .owns_data = true,
+            .data_is_allocated = true,
             .xref_table = XRefTable.init(allocator),
             .pages = .empty,
             .object_cache = std.AutoHashMap(u32, Object).init(allocator),
@@ -335,7 +374,7 @@ pub const Document = struct {
             // Use the comprehensive parseFontEncoding
             const enc = encoding.parseFontEncoding(arena, fd, struct {
                 fn wrapper(ctx: *const anyopaque, obj: parser.Object) parser.Object {
-                    const r: *const Resolver = @alignCast(@ptrCast(ctx));
+                    const r: *const Resolver = @ptrCast(@alignCast(ctx));
                     return r.resolve(obj);
                 }
             }.wrapper, &resolver) catch continue;
@@ -354,8 +393,18 @@ pub const Document = struct {
     /// Close the document and free resources
     pub fn close(self: *Document) void {
         if (self.owns_data and !is_wasm) {
-            const aligned_ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(@ptrCast(@constCast(self.data.ptr)));
-            std.posix.munmap(aligned_ptr[0..self.data.len]);
+            const aligned_ptr: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(@constCast(self.data.ptr)));
+            if (comptime is_windows) {
+                // Windows: always use allocator.free
+                self.allocator.free(aligned_ptr[0..self.data.len]);
+            } else {
+                // POSIX: check if allocated or mmap'd
+                if (self.data_is_allocated) {
+                    self.allocator.free(aligned_ptr[0..self.data.len]);
+                } else {
+                    std.posix.munmap(aligned_ptr[0..self.data.len]);
+                }
+            }
         }
 
         // Free cached reading order
