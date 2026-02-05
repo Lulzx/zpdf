@@ -76,7 +76,7 @@ pub const ErrorConfig = struct {
 };
 
 /// Parse error record
-pub const ParseError = struct {
+pub const ParseErrorRecord = struct {
     kind: Kind,
     offset: u64,
     message: []const u8,
@@ -117,7 +117,7 @@ pub const Document = struct {
     error_config: ErrorConfig,
 
     /// Accumulated errors
-    errors: std.ArrayList(ParseError),
+    errors: std.ArrayList(ParseErrorRecord),
 
     /// Pre-resolved font encodings (key: "pageNum:fontName")
     font_cache: std.StringHashMap(encoding.FontEncoding),
@@ -472,7 +472,10 @@ pub const Document = struct {
         var collector = interpreter.SpanCollector.init(allocator);
         errdefer collector.deinit();
 
-        try extractTextFromContentWithBounds(content, page.resources, &collector, &self.font_cache, page_num);
+        {
+            var nw: NullWriter = .{};
+            try extractContentStream(content, .{ .bounds = &collector }, &self.font_cache, page_num, collector.allocator, &nw);
+        }
         try collector.flush();
 
         return collector.spans.toOwnedSlice(collector.allocator);
@@ -587,8 +590,11 @@ pub const Document = struct {
                 var extractor = structtree.MarkedContentExtractor.init(allocator);
                 defer extractor.deinit();
 
-                extractTextWithMcidTracking(arena, content, page_num, &self.font_cache, &extractor) catch
-                    return self.extractTextGeometric(page_num, allocator);
+                {
+                    var nw: NullWriter = .{};
+                    extractContentStream(content, .{ .structured = &extractor }, &self.font_cache, page_num, arena, &nw) catch
+                        return self.extractTextGeometric(page_num, allocator);
+                }
 
                 // Collect text in structure tree order
                 var result: std.ArrayList(u8) = .empty;
@@ -721,7 +727,10 @@ pub const Document = struct {
                     var extractor = structtree.MarkedContentExtractor.init(allocator);
                     defer extractor.deinit();
 
-                    if (extractTextWithMcidTracking(arena, content, page_num, &self.font_cache, &extractor)) |_| {
+                    if (nw_blk: {
+                        var nw: NullWriter = .{};
+                        break :nw_blk extractContentStream(content, .{ .structured = &extractor }, &self.font_cache, page_num, arena, &nw);
+                    }) |_| {
                         // Collect text in structure tree order
                         const start_len = result.items.len;
                         for (mcids.items) |mcr| {
@@ -844,6 +853,68 @@ const ExtractionContext = struct {
     const MAX_DEPTH: u8 = 10; // Prevent infinite recursion
 };
 
+/// Extraction mode: controls how operators are dispatched
+const ExtractionMode = union(enum) {
+    /// Basic text extraction to writer (supports Form XObjects via Do)
+    stream: struct {
+        resources: ?Object.Dict,
+        ctx: *const ExtractionContext,
+    },
+    /// Collect spans with bounding boxes
+    bounds: *interpreter.SpanCollector,
+    /// Track marked content IDs for structure tree reading order
+    structured: *structtree.MarkedContentExtractor,
+};
+
+/// Try to buffer a token as an operand. Returns true if consumed (not an operator).
+fn pushOperand(operands: []interpreter.Operand, count: *usize, token: interpreter.ContentLexer.Token) bool {
+    switch (token) {
+        .operator => return false,
+        .number => |n| {
+            if (count.* < operands.len) {
+                operands[count.*] = .{ .number = n };
+                count.* += 1;
+            }
+        },
+        .string => |s| {
+            if (count.* < operands.len) {
+                operands[count.*] = .{ .string = s };
+                count.* += 1;
+            }
+        },
+        .hex_string => |s| {
+            if (count.* < operands.len) {
+                operands[count.*] = .{ .hex_string = s };
+                count.* += 1;
+            }
+        },
+        .name => |n| {
+            if (count.* < operands.len) {
+                operands[count.*] = .{ .name = n };
+                count.* += 1;
+            }
+        },
+        .array => |a| {
+            if (count.* < operands.len) {
+                operands[count.*] = .{ .array = a };
+                count.* += 1;
+            }
+        },
+    }
+    return true;
+}
+
+/// Look up a font encoding in the cache by page number and font name.
+fn lookupFont(
+    font_cache: *const std.StringHashMap(encoding.FontEncoding),
+    key_buf: *[64]u8,
+    page_num: usize,
+    font_name: []const u8,
+) ?*const encoding.FontEncoding {
+    const key = std.fmt.bufPrint(key_buf, "{d}:{s}", .{ page_num, font_name }) catch return null;
+    return font_cache.getPtr(key);
+}
+
 /// Extract text from content stream using pre-resolved fonts
 fn extractTextFromContent(
     allocator: std.mem.Allocator,
@@ -853,15 +924,18 @@ fn extractTextFromContent(
     writer: anytype,
 ) !void {
     // Simple path without Form XObject support (for backward compatibility)
-    try extractTextFromContentWithContext(content, null, &.{
-        .allocator = allocator,
-        .data = &.{},
-        .xref_table = undefined,
-        .object_cache = undefined,
-        .font_cache = font_cache,
-        .page_num = page_num,
-        .depth = 0,
-    }, writer);
+    try extractContentStream(content, .{ .stream = .{
+        .resources = null,
+        .ctx = &.{
+            .allocator = allocator,
+            .data = &.{},
+            .xref_table = undefined,
+            .object_cache = undefined,
+            .font_cache = font_cache,
+            .page_num = page_num,
+            .depth = 0,
+        },
+    } }, font_cache, page_num, allocator, writer);
 }
 
 /// Extract text with full context (supports Form XObjects)
@@ -871,83 +945,92 @@ fn extractTextFromContentFull(
     ctx: *const ExtractionContext,
     writer: anytype,
 ) !void {
-    try extractTextFromContentWithContext(content, resources, ctx, writer);
+    try extractContentStream(content, .{ .stream = .{
+        .resources = resources,
+        .ctx = ctx,
+    } }, ctx.font_cache, ctx.page_num, ctx.allocator, writer);
 }
 
-fn extractTextFromContentWithContext(
+/// Unified content stream extraction. All three extraction paths go through this.
+fn extractContentStream(
     content: []const u8,
-    resources: ?Object.Dict,
-    ctx: *const ExtractionContext,
+    mode: ExtractionMode,
+    font_cache: *const std.StringHashMap(encoding.FontEncoding),
+    page_num: usize,
+    allocator: std.mem.Allocator,
     writer: anytype,
 ) !void {
-    var lexer = interpreter.ContentLexer.init(ctx.allocator, content);
+    var lexer = interpreter.ContentLexer.init(allocator, content);
     var operands: [64]interpreter.Operand = undefined;
     var operand_count: usize = 0;
 
     var current_font: ?*const encoding.FontEncoding = null;
     var prev_x: f64 = 0;
     var prev_y: f64 = 0;
+    var current_x: f64 = 0;
+    var current_y: f64 = 0;
     var font_size: f64 = 12;
 
-    // Buffer for font cache key lookup
     var key_buf: [64]u8 = undefined;
 
+    // Text buffer for structured mode (MCID tracking)
+    var text_buf: [4096]u8 = undefined;
+    var text_pos: usize = 0;
+
     while (try lexer.next()) |token| {
-        switch (token) {
-            .number => |n| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .number = n };
-                    operand_count += 1;
-                }
-            },
-            .string => |s| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .string = s };
-                    operand_count += 1;
-                }
-            },
-            .hex_string => |s| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .hex_string = s };
-                    operand_count += 1;
-                }
-            },
-            .name => |n| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .name = n };
-                    operand_count += 1;
-                }
-            },
-            .array => |arr| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .array = arr };
-                    operand_count += 1;
-                }
-            },
-            .operator => |op| {
-                // Fast path: switch on first character to minimize string comparisons
-                if (op.len > 0) switch (op[0]) {
-                    'B' => if (op.len == 2 and op[1] == 'T') {},
-                    'E' => if (op.len == 2 and op[1] == 'T') {},
-                    'D' => if (op.len == 2 and op[1] == 'o') {
-                        // Do operator: invoke XObject
-                        if (operand_count >= 1 and operands[0] == .name) {
-                            try handleDoOperator(operands[0].name, resources, ctx, writer);
+        if (pushOperand(&operands, &operand_count, token)) continue;
+
+        // token is an operator
+        const op = token.operator;
+        if (op.len > 0) switch (op[0]) {
+            'B' => switch (mode) {
+                .stream => if (op.len == 2 and op[1] == 'T') {},
+                .bounds => {},
+                .structured => |extractor| {
+                    if (std.mem.eql(u8, op, "BDC")) {
+                        if (operand_count >= 2) {
+                            const tag = operands[0].asName() orelse "Unknown";
+                            const mcid = extractMcidFromDict(operands[1]);
+                            try extractor.beginMarkedContent(tag, mcid);
                         }
-                    },
-                    'T' => if (op.len == 2) switch (op[1]) {
-                        'f' => if (operand_count >= 2) {
-                            // Set font: /FontName size Tf
-                            if (operands[0] == .name) {
-                                const font_name = operands[0].name;
-                                const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ ctx.page_num, font_name }) catch "";
-                                current_font = ctx.font_cache.getPtr(key);
-                            }
-                            font_size = operands[1].number;
-                        },
-                        'd', 'D' => if (operand_count >= 2) {
-                            // For vertical writing (WMode=1), check X displacement
-                            // For horizontal writing (WMode=0), check Y displacement
+                    } else if (std.mem.eql(u8, op, "BMC")) {
+                        if (operand_count >= 1) {
+                            const tag = operands[0].asName() orelse "Unknown";
+                            try extractor.beginMarkedContent(tag, null);
+                        }
+                    }
+                },
+            },
+            'E' => switch (mode) {
+                .stream => if (op.len == 2 and op[1] == 'T') {},
+                .bounds => {},
+                .structured => |extractor| {
+                    if (std.mem.eql(u8, op, "EMC")) {
+                        extractor.endMarkedContent();
+                    }
+                },
+            },
+            'D' => switch (mode) {
+                .stream => |s| if (op.len == 2 and op[1] == 'o') {
+                    if (operand_count >= 1 and operands[0] == .name) {
+                        try handleDoOperator(operands[0].name, s.resources, s.ctx, writer);
+                    }
+                },
+                .bounds, .structured => {},
+            },
+            'T' => if (op.len == 2) switch (op[1]) {
+                'f' => if (operand_count >= 2) {
+                    if (operands[0] == .name) {
+                        current_font = lookupFont(font_cache, &key_buf, page_num, operands[0].name);
+                    }
+                    font_size = operands[1].number;
+                    if (mode == .bounds) {
+                        mode.bounds.setFontSize(font_size);
+                    }
+                },
+                'd', 'D' => if (operand_count >= 2) {
+                    switch (mode) {
+                        .stream => {
                             const wmode = if (current_font) |f| f.wmode else 0;
                             const displacement = if (wmode == 1) operands[0].number else operands[1].number;
                             if (@abs(displacement) > font_size * 0.5 and prev_y != 0) {
@@ -955,9 +1038,19 @@ fn extractTextFromContentWithContext(
                             }
                             prev_y = operands[1].number;
                         },
-                        'm' => if (operand_count >= 6) {
+                        .bounds => |collector| {
+                            current_x += operands[0].number;
+                            current_y += operands[1].number;
+                            try collector.flush();
+                            collector.setPosition(current_x, current_y);
+                        },
+                        .structured => {},
+                    }
+                },
+                'm' => if (operand_count >= 6) {
+                    switch (mode) {
+                        .stream => {
                             const wmode = if (current_font) |f| f.wmode else 0;
-                            // Tm sets full matrix: [a b c d e f] - e is X, f is Y
                             const new_pos = if (wmode == 1) operands[4].number else operands[5].number;
                             const prev_pos = if (wmode == 1) prev_x else prev_y;
                             if (@abs(new_pos - prev_pos) > font_size * 0.5 and prev_pos != 0) {
@@ -966,31 +1059,82 @@ fn extractTextFromContentWithContext(
                             prev_x = operands[4].number;
                             prev_y = operands[5].number;
                         },
-                        '*' => {
-                            try writer.writeByte('\n');
+                        .bounds => |collector| {
+                            current_x = operands[4].number;
+                            current_y = operands[5].number;
+                            try collector.flush();
+                            collector.setPosition(current_x, current_y);
                         },
-                        'j' => if (operand_count >= 1) {
-                            try writeTextWithFont(operands[0], current_font, writer);
+                        .structured => {},
+                    }
+                },
+                '*' => switch (mode) {
+                    .stream => try writer.writeByte('\n'),
+                    .bounds => |collector| try collector.flush(),
+                    .structured => {},
+                },
+                'j' => if (operand_count >= 1) {
+                    switch (mode) {
+                        .stream => try writeTextWithFont(operands[0], current_font, writer),
+                        .bounds => |collector| try writeTextWithFont(operands[0], current_font, collector),
+                        .structured => |extractor| {
+                            text_pos = 0;
+                            writeTextToBuffer(operands[0], current_font, &text_buf, &text_pos);
+                            if (text_pos > 0) try extractor.addText(text_buf[0..text_pos]);
                         },
-                        'J' => if (operand_count >= 1) {
-                            try writeTJArrayWithFont(operands[0], current_font, writer);
+                    }
+                },
+                'J' => if (operand_count >= 1) {
+                    switch (mode) {
+                        .stream => try writeTJArrayWithFont(operands[0], current_font, writer),
+                        .bounds => |collector| try writeTJArrayToCollector(operands[0], current_font, collector),
+                        .structured => |extractor| {
+                            text_pos = 0;
+                            writeTJArrayToBuffer(operands[0], current_font, &text_buf, &text_pos);
+                            if (text_pos > 0) try extractor.addText(text_buf[0..text_pos]);
                         },
-                        else => {},
-                    },
-                    '\'' => if (operand_count >= 1) {
+                    }
+                },
+                else => {},
+            },
+            '\'' => if (operand_count >= 1) {
+                switch (mode) {
+                    .stream => {
                         try writer.writeByte('\n');
                         try writeTextWithFont(operands[0], current_font, writer);
                     },
-                    '"' => if (operand_count >= 3) {
+                    .bounds => |collector| {
+                        try collector.flush();
+                        try writeTextWithFont(operands[0], current_font, collector);
+                    },
+                    .structured => |extractor| {
+                        text_pos = 0;
+                        writeTextToBuffer(operands[0], current_font, &text_buf, &text_pos);
+                        if (text_pos > 0) try extractor.addText(text_buf[0..text_pos]);
+                    },
+                }
+            },
+            '"' => if (operand_count >= 3) {
+                switch (mode) {
+                    .stream => {
                         try writer.writeByte('\n');
                         try writeTextWithFont(operands[2], current_font, writer);
                     },
-                    else => {},
-                };
-
-                operand_count = 0;
+                    .bounds => |collector| {
+                        try collector.flush();
+                        try writeTextWithFont(operands[2], current_font, collector);
+                    },
+                    .structured => |extractor| {
+                        text_pos = 0;
+                        writeTextToBuffer(operands[2], current_font, &text_buf, &text_pos);
+                        if (text_pos > 0) try extractor.addText(text_buf[0..text_pos]);
+                    },
+                }
             },
-        }
+            else => {},
+        };
+
+        operand_count = 0;
     }
 }
 
@@ -1062,7 +1206,10 @@ fn handleDoOperator(
         .depth = ctx.depth + 1,
     };
 
-    extractTextFromContentWithContext(form_content, form_resources, &child_ctx, writer) catch {};
+    extractContentStream(form_content, .{ .stream = .{
+        .resources = form_resources,
+        .ctx = &child_ctx,
+    } }, ctx.font_cache, ctx.page_num, ctx.allocator, writer) catch {};
 }
 
 fn writeTextWithFont(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, writer: anytype) !void {
@@ -1075,7 +1222,27 @@ fn writeTextWithFont(operand: interpreter.Operand, font: ?*const encoding.FontEn
     if (font) |enc| {
         try enc.decode(data, writer);
     } else {
-        try writeTextOperand(operand, writer);
+        try writeTextFallback(data, writer);
+    }
+}
+
+/// WinAnsi fallback decoding for text without font encoding
+fn writeTextFallback(data: []const u8, writer: anytype) !void {
+    for (data) |byte| {
+        if (byte >= 32 and byte < 127) {
+            try writer.writeByte(byte);
+        } else if (byte == 0) {
+            // CID separator
+        } else {
+            const codepoint = encoding.win_ansi_encoding[byte];
+            if (codepoint != 0 and codepoint < 128) {
+                try writer.writeByte(@truncate(codepoint));
+            } else if (codepoint != 0) {
+                var buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(codepoint, &buf) catch 1;
+                try writer.writeAll(buf[0..len]);
+            }
+        }
     }
 }
 
@@ -1098,189 +1265,7 @@ fn writeTJArrayWithFont(operand: interpreter.Operand, font: ?*const encoding.Fon
     }
 }
 
-fn writeTextOperand(operand: interpreter.Operand, writer: anytype) !void {
-    const data = switch (operand) {
-        .string => |s| s,
-        .hex_string => |s| s,
-        else => return,
-    };
-
-    // Simple WinAnsi-ish decoding
-    for (data) |byte| {
-        if (byte >= 32 and byte < 127) {
-            try writer.writeByte(byte);
-        } else if (byte == 0) {
-            // CID separator
-        } else {
-            // Extended character - use WinAnsi table or fallback
-            const codepoint = encoding.win_ansi_encoding[byte];
-            if (codepoint != 0 and codepoint < 128) {
-                try writer.writeByte(@truncate(codepoint));
-            } else if (codepoint != 0) {
-                var buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(codepoint, &buf) catch 1;
-                try writer.writeAll(buf[0..len]);
-            }
-        }
-    }
-}
-
-fn writeTJArray(operand: interpreter.Operand, writer: anytype) !void {
-    const arr = switch (operand) {
-        .array => |a| a,
-        else => return,
-    };
-
-    for (arr) |item| {
-        switch (item) {
-            .string, .hex_string => try writeTextOperand(item, writer),
-            .number => |n| {
-                if (n < -100) {
-                    try writer.writeByte(' ');
-                }
-            },
-            else => {},
-        }
-    }
-}
-
-fn extractTextFromContentWithBounds(
-    content: []const u8,
-    resources: ?Object.Dict,
-    collector: *interpreter.SpanCollector,
-    font_cache: *std.StringHashMap(encoding.FontEncoding),
-    page_num: usize,
-) !void {
-    _ = resources;
-
-    var lexer = interpreter.ContentLexer.init(collector.allocator, content);
-    var operands: [64]interpreter.Operand = undefined;
-    var operand_count: usize = 0;
-
-    var current_x: f64 = 0;
-    var current_y: f64 = 0;
-    var font_size: f64 = 12;
-    var current_font: ?*const encoding.FontEncoding = null;
-
-    // Buffer for font cache key lookup
-    var key_buf: [64]u8 = undefined;
-
-    while (try lexer.next()) |token| {
-        switch (token) {
-            .number => |n| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .number = n };
-                    operand_count += 1;
-                }
-            },
-            .string => |s| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .string = s };
-                    operand_count += 1;
-                }
-            },
-            .hex_string => |s| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .hex_string = s };
-                    operand_count += 1;
-                }
-            },
-            .name => |n| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .name = n };
-                    operand_count += 1;
-                }
-            },
-            .array => |arr| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .array = arr };
-                    operand_count += 1;
-                }
-            },
-            .operator => |op| {
-                if (op.len > 0) switch (op[0]) {
-                    'T' => if (op.len == 2) switch (op[1]) {
-                        'f' => if (operand_count >= 2) {
-                            // Set font: /FontName size Tf
-                            if (operands[0] == .name) {
-                                const font_name = operands[0].name;
-                                // Look up font with page:font_name key
-                                const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_num, font_name }) catch "";
-                                current_font = font_cache.getPtr(key);
-                            }
-                            font_size = operands[1].number;
-                            collector.setFontSize(font_size);
-                        },
-                        'd', 'D' => if (operand_count >= 2) {
-                            current_x += operands[0].number;
-                            current_y += operands[1].number;
-                            try collector.flush();
-                            collector.setPosition(current_x, current_y);
-                        },
-                        'm' => if (operand_count >= 6) {
-                            current_x = operands[4].number;
-                            current_y = operands[5].number;
-                            try collector.flush();
-                            collector.setPosition(current_x, current_y);
-                        },
-                        '*' => {
-                            try collector.flush();
-                        },
-                        'j' => if (operand_count >= 1) {
-                            try writeTextToCollector(operands[0], current_font, collector);
-                        },
-                        'J' => if (operand_count >= 1) {
-                            try writeTJArrayToCollector(operands[0], current_font, collector);
-                        },
-                        else => {},
-                    },
-                    '\'' => if (operand_count >= 1) {
-                        try collector.flush();
-                        try writeTextToCollector(operands[0], current_font, collector);
-                    },
-                    '"' => if (operand_count >= 3) {
-                        try collector.flush();
-                        try writeTextToCollector(operands[2], current_font, collector);
-                    },
-                    else => {},
-                };
-                operand_count = 0;
-            },
-        }
-    }
-}
-
-fn writeTextToCollector(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, collector: *interpreter.SpanCollector) !void {
-    const data = switch (operand) {
-        .string => |s| s,
-        .hex_string => |s| s,
-        else => return,
-    };
-
-    if (font) |enc| {
-        // Use font encoding to decode text
-        try enc.decode(data, collector);
-    } else {
-        // Fallback to simple WinAnsi-ish decoding
-        for (data) |byte| {
-            if (byte >= 32 and byte < 127) {
-                try collector.writeByte(byte);
-            } else if (byte == 0) {
-                // CID separator - ignore
-            } else {
-                const codepoint = encoding.win_ansi_encoding[byte];
-                if (codepoint != 0 and codepoint < 128) {
-                    try collector.writeByte(@truncate(codepoint));
-                } else if (codepoint != 0) {
-                    var buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(codepoint, &buf) catch 1;
-                    try collector.writeAll(buf[0..len]);
-                }
-            }
-        }
-    }
-}
-
+/// TJ array handler for SpanCollector (needs position tracking on spacing)
 fn writeTJArrayToCollector(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, collector: *interpreter.SpanCollector) !void {
     const arr = switch (operand) {
         .array => |a| a,
@@ -1289,9 +1274,8 @@ fn writeTJArrayToCollector(operand: interpreter.Operand, font: ?*const encoding.
 
     for (arr) |item| {
         switch (item) {
-            .string, .hex_string => try writeTextToCollector(item, font, collector),
+            .string, .hex_string => try writeTextWithFont(item, font, collector),
             .number => |n| {
-                // TJ spacing: negative = move right (add space), positive = move left (kern)
                 if (n < -150) {
                     try collector.flush();
                 }
@@ -1303,139 +1287,10 @@ fn writeTJArrayToCollector(operand: interpreter.Operand, font: ?*const encoding.
     }
 }
 
-/// Extract text with MCID tracking for structure-tree-based reading order
-fn extractTextWithMcidTracking(
-    allocator: std.mem.Allocator,
-    content: []const u8,
-    page_num: usize,
-    font_cache: *const std.StringHashMap(encoding.FontEncoding),
-    extractor: *structtree.MarkedContentExtractor,
-) !void {
-    var lexer = interpreter.ContentLexer.init(allocator, content);
-    var operands: [64]interpreter.Operand = undefined;
-    var operand_count: usize = 0;
-
-    var current_font: ?*const encoding.FontEncoding = null;
-    var font_size: f64 = 12;
-
-    // Buffer for font cache key lookup
-    var key_buf: [64]u8 = undefined;
-
-    // Text buffer for current extraction
-    var text_buf: [4096]u8 = undefined;
-    var text_pos: usize = 0;
-
-    while (try lexer.next()) |token| {
-        switch (token) {
-            .number => |n| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .number = n };
-                    operand_count += 1;
-                }
-            },
-            .string => |s| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .string = s };
-                    operand_count += 1;
-                }
-            },
-            .hex_string => |s| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .hex_string = s };
-                    operand_count += 1;
-                }
-            },
-            .name => |n| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .name = n };
-                    operand_count += 1;
-                }
-            },
-            .array => |arr| {
-                if (operand_count < 64) {
-                    operands[operand_count] = .{ .array = arr };
-                    operand_count += 1;
-                }
-            },
-            .operator => |op| {
-                if (op.len > 0) switch (op[0]) {
-                    'B' => {
-                        if (std.mem.eql(u8, op, "BDC")) {
-                            // Begin marked content with dictionary: /Tag <<...>> BDC
-                            // or /Tag <</MCID n>> BDC
-                            if (operand_count >= 2) {
-                                const tag = operands[0].asName() orelse "Unknown";
-                                const mcid = extractMcidFromDict(operands[1]);
-                                try extractor.beginMarkedContent(tag, mcid);
-                            }
-                        } else if (std.mem.eql(u8, op, "BMC")) {
-                            // Begin marked content: /Tag BMC
-                            if (operand_count >= 1) {
-                                const tag = operands[0].asName() orelse "Unknown";
-                                try extractor.beginMarkedContent(tag, null);
-                            }
-                        }
-                    },
-                    'E' => {
-                        if (std.mem.eql(u8, op, "EMC")) {
-                            extractor.endMarkedContent();
-                        }
-                    },
-                    'T' => if (op.len == 2) switch (op[1]) {
-                        'f' => if (operand_count >= 2) {
-                            if (operands[0] == .name) {
-                                const font_name = operands[0].name;
-                                const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_num, font_name }) catch "";
-                                current_font = font_cache.getPtr(key);
-                            }
-                            font_size = operands[1].number;
-                        },
-                        'j' => if (operand_count >= 1) {
-                            text_pos = 0;
-                            writeTextToBuffer(operands[0], current_font, &text_buf, &text_pos);
-                            if (text_pos > 0) {
-                                try extractor.addText(text_buf[0..text_pos]);
-                            }
-                        },
-                        'J' => if (operand_count >= 1) {
-                            text_pos = 0;
-                            writeTJArrayToBuffer(operands[0], current_font, &text_buf, &text_pos);
-                            if (text_pos > 0) {
-                                try extractor.addText(text_buf[0..text_pos]);
-                            }
-                        },
-                        else => {},
-                    },
-                    '\'' => if (operand_count >= 1) {
-                        text_pos = 0;
-                        writeTextToBuffer(operands[0], current_font, &text_buf, &text_pos);
-                        if (text_pos > 0) {
-                            try extractor.addText(text_buf[0..text_pos]);
-                        }
-                    },
-                    '"' => if (operand_count >= 3) {
-                        text_pos = 0;
-                        writeTextToBuffer(operands[2], current_font, &text_buf, &text_pos);
-                        if (text_pos > 0) {
-                            try extractor.addText(text_buf[0..text_pos]);
-                        }
-                    },
-                    else => {},
-                };
-                operand_count = 0;
-            },
-        }
-    }
-}
-
 /// Extract MCID from a dictionary operand (for BDC)
 fn extractMcidFromDict(operand: interpreter.Operand) ?i32 {
-    // The operand could be a dict-like structure in the operand stack
-    // In content streams, BDC is typically: /Tag <</MCID n>> BDC
-    // The lexer doesn't parse inline dicts, so we need to check the raw array
     switch (operand) {
         .array => |arr| {
-            // Look for /MCID followed by a number
             var i: usize = 0;
             while (i + 1 < arr.len) : (i += 1) {
                 if (arr[i] == .name and std.mem.eql(u8, arr[i].name, "MCID")) {
@@ -1450,7 +1305,7 @@ fn extractMcidFromDict(operand: interpreter.Operand) ?i32 {
     return null;
 }
 
-/// Write text to a buffer (for MCID tracking)
+/// Write text to a fixed buffer (for MCID tracking in structured mode)
 fn writeTextToBuffer(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, buf: []u8, pos: *usize) void {
     const data = switch (operand) {
         .string => |s| s,
@@ -1459,11 +1314,9 @@ fn writeTextToBuffer(operand: interpreter.Operand, font: ?*const encoding.FontEn
     };
 
     if (font) |enc| {
-        // Create a buffer writer
-        var writer = BufferWriter{ .buf = buf, .pos = pos };
-        enc.decode(data, &writer) catch {};
+        var bw = BufferWriter{ .buf = buf, .pos = pos };
+        enc.decode(data, &bw) catch {};
     } else {
-        // Fallback to simple decoding
         for (data) |byte| {
             if (pos.* >= buf.len) break;
             if (byte >= 32 and byte < 127) {
@@ -1488,7 +1341,7 @@ fn writeTextToBuffer(operand: interpreter.Operand, font: ?*const encoding.FontEn
     }
 }
 
-/// Write TJ array to buffer
+/// Write TJ array to a fixed buffer (for MCID tracking in structured mode)
 fn writeTJArrayToBuffer(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, buf: []u8, pos: *usize) void {
     const arr = switch (operand) {
         .array => |a| a,
@@ -1509,7 +1362,7 @@ fn writeTJArrayToBuffer(operand: interpreter.Operand, font: ?*const encoding.Fon
     }
 }
 
-/// Simple buffer writer for font decoding
+/// Simple buffer writer for font decoding into fixed buffers
 const BufferWriter = struct {
     buf: []u8,
     pos: *usize,
@@ -1534,6 +1387,13 @@ const BufferWriter = struct {
         _ = args;
         _ = self;
     }
+};
+
+/// No-op writer used as a dummy when the writer parameter is unused (structured mode)
+const NullWriter = struct {
+    pub fn writeAll(_: *NullWriter, _: []const u8) !void {}
+    pub fn writeByte(_: *NullWriter, _: u8) !void {}
+    pub fn print(_: *NullWriter, comptime _: []const u8, _: anytype) !void {}
 };
 
 // ============================================================================

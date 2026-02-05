@@ -11,7 +11,7 @@
 //! We optimize heavily for FlateDecode since it's the hot path.
 
 const std = @import("std");
-const Object = @import("root.zig").Object;
+const Object = @import("parser.zig").Object;
 
 pub const DecompressError = error{
     UnsupportedFilter,
