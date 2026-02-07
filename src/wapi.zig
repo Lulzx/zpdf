@@ -119,6 +119,28 @@ export fn zpdf_extract_all(handle: i32, out_len: *usize) ?[*]u8 {
     return null;
 }
 
+/// Extract text from all pages as Markdown with semantic formatting
+/// Returns pointer to Markdown text buffer, sets out_len to buffer length
+/// Caller must free with wasm_free
+export fn zpdf_extract_all_markdown(handle: i32, out_len: *usize) ?[*]u8 {
+    if (handle < 0 or handle >= MAX_DOCUMENTS) return null;
+    const idx: usize = @intCast(handle);
+
+    if (documents[idx]) |doc| {
+        const result = doc.extractAllMarkdown(wasm_allocator) catch return null;
+
+        // extractAllMarkdown returns an allocated slice; treat zero-length as "no data"
+        if (result.len == 0) {
+            out_len.* = 0;
+            return null;
+        }
+
+        out_len.* = result.len;
+        return result.ptr;
+    }
+    return null;
+}
+
 /// Get page dimensions
 /// Returns 0 on success, -1 on error
 export fn zpdf_get_page_info(handle: i32, page_num: i32, width: *f64, height: *f64, rotation: *i32) i32 {

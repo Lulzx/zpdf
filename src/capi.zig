@@ -192,6 +192,14 @@ export fn zpdf_extract_all_markdown(handle: ?*ZpdfDocument, out_len: *usize) ?[*
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
         const result = doc.extractAllMarkdown(c_allocator) catch return null;
+
+        // extractAllMarkdown returns an allocated slice; treat zero-length as "no data"
+        if (result.len == 0) {
+            c_allocator.free(result);
+            out_len.* = 0;
+            return null;
+        }
+
         out_len.* = result.len;
         return result.ptr;
     }
