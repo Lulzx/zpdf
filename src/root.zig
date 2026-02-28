@@ -727,10 +727,9 @@ pub const Document = struct {
                     var extractor = structtree.MarkedContentExtractor.init(allocator);
                     defer extractor.deinit();
 
-                    if (nw_blk: {
-                        var nw: NullWriter = .{};
-                        break :nw_blk extractContentStream(content, .{ .structured = &extractor }, &self.font_cache, page_num, arena, &nw);
-                    }) |_| {
+                    var nw: NullWriter = .{};
+                    const extract_ok = extractContentStream(content, .{ .structured = &extractor }, &self.font_cache, page_num, arena, &nw);
+                    if (extract_ok) |_| {
                         // Collect text in structure tree order
                         const start_len = result.items.len;
                         for (mcids.items) |mcr| {
@@ -855,10 +854,11 @@ const ExtractionContext = struct {
 
 /// Extraction mode: controls how operators are dispatched
 const ExtractionMode = union(enum) {
-    /// Basic text extraction to writer (supports Form XObjects via Do)
+    /// Basic text extraction to writer (supports Form XObjects via Do).
+    /// ctx is null when no XObject resolution is needed (e.g. simple text-only paths).
     stream: struct {
         resources: ?Object.Dict,
-        ctx: *const ExtractionContext,
+        ctx: ?*const ExtractionContext,
     },
     /// Collect spans with bounding boxes
     bounds: *interpreter.SpanCollector,
@@ -923,18 +923,10 @@ fn extractTextFromContent(
     font_cache: *const std.StringHashMap(encoding.FontEncoding),
     writer: anytype,
 ) !void {
-    // Simple path without Form XObject support (for backward compatibility)
+    // Simple path without Form XObject support - null ctx skips Do handling
     try extractContentStream(content, .{ .stream = .{
         .resources = null,
-        .ctx = &.{
-            .allocator = allocator,
-            .data = &.{},
-            .xref_table = undefined,
-            .object_cache = undefined,
-            .font_cache = font_cache,
-            .page_num = page_num,
-            .depth = 0,
-        },
+        .ctx = null,
     } }, font_cache, page_num, allocator, writer);
 }
 
@@ -973,8 +965,10 @@ fn extractContentStream(
 
     var key_buf: [64]u8 = undefined;
 
-    // Text buffer for structured mode (MCID tracking)
-    var text_buf: [4096]u8 = undefined;
+    // Text buffer for structured mode (MCID tracking).
+    // Spans longer than MCID_TEXT_BUF_SIZE bytes are silently truncated.
+    const MCID_TEXT_BUF_SIZE = 4096;
+    var text_buf: [MCID_TEXT_BUF_SIZE]u8 = undefined;
     var text_pos: usize = 0;
 
     while (try lexer.next()) |token| {
@@ -1142,14 +1136,14 @@ fn extractContentStream(
 fn handleDoOperator(
     xobject_name: []const u8,
     resources: ?Object.Dict,
-    ctx: *const ExtractionContext,
+    maybe_ctx: ?*const ExtractionContext,
     writer: anytype,
 ) anyerror!void {
+    // No context means XObject resolution is unavailable; skip silently
+    const ctx = maybe_ctx orelse return;
+
     // Check recursion depth
     if (ctx.depth >= ExtractionContext.MAX_DEPTH) return;
-
-    // Need valid context for XObject resolution
-    if (ctx.data.len == 0) return;
 
     // Get XObject dictionary from resources
     const res = resources orelse return;
