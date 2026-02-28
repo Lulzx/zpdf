@@ -697,7 +697,18 @@ pub const Document = struct {
             }
         }
 
-        // Fall back to geometric sorting
+        // For untagged content, prefer stream-order extraction first.
+        // This generally tracks MuPDF text extraction more closely on large
+        // technical PDFs, while keeping geometric extraction as a fallback.
+        const stream_text = self.extractTextStreamOrder(page_num, allocator) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return self.extractTextGeometric(page_num, allocator);
+        };
+        if (stream_text.len > 0) {
+            return stream_text;
+        }
+
+        allocator.free(stream_text);
         return self.extractTextGeometric(page_num, allocator);
     }
 
@@ -749,11 +760,19 @@ pub const Document = struct {
         const num_pages = self.pages.items.len;
         if (num_pages == 0) return allocator.alloc(u8, 0);
 
-        // Skip pre-loading for large documents (lazy load is faster)
+        // Parse and cache structure tree once for the full document.
+        self.ensureReadingOrder();
+
+        // For untagged documents (no structure entries), use stream-order
+        // extraction for full-document accuracy mode. This aligns better with
+        // MuPDF-style extraction and avoids extra per-page fallback overhead.
+        const has_structure_entries = if (self.cached_reading_order) |cache| cache.count() > 0 else false;
+        if (!has_structure_entries) {
+            return self.extractAllTextFast(allocator);
+        }
+
+        // Pre-load all fonts for smaller docs to reduce per-page overhead.
         if (num_pages <= 100) {
-            // Pre-cache reading order once
-            self.ensureReadingOrder();
-            // Pre-load all fonts (avoids per-page overhead)
             for (0..num_pages) |i| {
                 self.ensurePageFonts(i);
             }
