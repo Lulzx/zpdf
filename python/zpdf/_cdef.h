@@ -5,6 +5,7 @@ ZpdfDocument* zpdf_open_memory(const uint8_t* data, size_t len);
 ZpdfDocument* zpdf_open_memory_unsafe(const uint8_t* data, size_t len);
 void zpdf_close(ZpdfDocument* doc);
 int zpdf_page_count(ZpdfDocument* doc);
+bool zpdf_is_encrypted(ZpdfDocument* doc);
 uint8_t* zpdf_extract_page(ZpdfDocument* doc, int page_num, size_t* out_len);
 uint8_t* zpdf_extract_all(ZpdfDocument* doc, size_t* out_len);
 uint8_t* zpdf_extract_all_fast(ZpdfDocument* doc, size_t* out_len);

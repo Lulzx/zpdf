@@ -102,6 +102,12 @@ class Document:
             raise InvalidPdfError("Failed to get page count")
         return count
 
+    @property
+    def is_encrypted(self) -> bool:
+        """Check if the PDF is encrypted. Encrypted PDFs cannot be extracted."""
+        self._check_open()
+        return lib.zpdf_is_encrypted(self._handle)
+
     def get_page_info(self, page_num: int) -> PageInfo:
         self._check_open()
         width = ffi.new("double*")

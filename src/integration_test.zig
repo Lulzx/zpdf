@@ -218,6 +218,31 @@ test "parse incremental PDF update" {
     try std.testing.expect(obj4_entry.?.offset > orig_pos.?);
 }
 
+test "isEncrypted returns false for normal PDF" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "Not encrypted");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    try std.testing.expect(!doc.isEncrypted());
+}
+
+test "isEncrypted returns true for encrypted PDF" {
+    const allocator = std.testing.allocator;
+
+    // Build a minimal PDF with /Encrypt in the trailer
+    const pdf_data = try testpdf.generateEncryptedPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    try std.testing.expect(doc.isEncrypted());
+}
+
 test "extract text from incremental PDF - gets updated content" {
     const allocator = std.testing.allocator;
 

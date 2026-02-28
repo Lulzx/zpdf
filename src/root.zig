@@ -91,6 +91,7 @@ pub const ParseErrorRecord = struct {
         invalid_stream,
         encoding_error,
         syntax_error,
+        encrypted,
     };
 };
 
@@ -286,6 +287,19 @@ pub const Document = struct {
             }
         };
 
+        // Check for encryption
+        if (self.xref_table.trailer.get("Encrypt") != null) {
+            if (!self.error_config.continue_on_parse_error) {
+                return error.EncryptedPdf;
+            }
+            try self.errors.append(self.allocator, .{
+                .kind = .encrypted,
+                .offset = 0,
+                .message = "PDF is encrypted; text extraction will produce incorrect results",
+            });
+            // Still parse pages so page_count works, but extraction will be unreliable
+        }
+
         // Build page tree (uses arena for all allocations)
         const pages_slice = pagetree.buildPageTree(arena, self.data, &self.xref_table) catch |err| {
             if (self.error_config.continue_on_parse_error) {
@@ -431,6 +445,11 @@ pub const Document = struct {
         self.font_obj_cache.deinit();
 
         self.allocator.destroy(self);
+    }
+
+    /// Check if the document is encrypted
+    pub fn isEncrypted(self: *const Document) bool {
+        return self.xref_table.trailer.get("Encrypt") != null;
     }
 
     /// Get number of pages

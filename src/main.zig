@@ -151,6 +151,11 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer doc.close();
 
+    // Warn about encrypted PDFs
+    if (doc.isEncrypted()) {
+        std.debug.print("Warning: {s} is encrypted. Text extraction may produce incorrect results.\n", .{path});
+    }
+
     // Setup output
     const output_handle = if (output_file) |out_path|
         std.fs.cwd().createFile(out_path, .{}) catch |err| {
@@ -457,12 +462,14 @@ fn runInfo(allocator: std.mem.Allocator, args: []const []const u8) !void {
         \\Size: {} bytes
         \\Pages: {}
         \\XRef entries: {}
+        \\Encrypted: {s}
         \\
     , .{
         path,
         doc.data.len,
         doc.pages.items.len,
         doc.xref_table.entries.count(),
+        if (doc.isEncrypted()) "yes" else "no",
     });
 
     // Print page sizes

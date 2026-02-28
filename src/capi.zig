@@ -42,6 +42,14 @@ export fn zpdf_page_count(handle: ?*ZpdfDocument) c_int {
     return -1;
 }
 
+export fn zpdf_is_encrypted(handle: ?*ZpdfDocument) bool {
+    if (handle) |h| {
+        const doc: *const zpdf.Document = @ptrCast(@alignCast(h));
+        return doc.isEncrypted();
+    }
+    return false;
+}
+
 export fn zpdf_extract_page(handle: ?*ZpdfDocument, page_num: c_int, out_len: *usize) ?[*]u8 {
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));

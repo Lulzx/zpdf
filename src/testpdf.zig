@@ -399,6 +399,71 @@ pub fn generateIncrementalPdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Generate a minimal PDF with an /Encrypt entry in the trailer.
+/// This doesn't implement real encryption - it just has the /Encrypt key
+/// so the parser detects it as encrypted.
+pub fn generateEncryptedPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    // Object 1: Catalog
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // Object 2: Pages
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Object 3: Page
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    // Object 4: Content stream
+    const content = "BT\n/F1 12 Tf\n100 700 Td\n(Encrypted) Tj\nET\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+
+    // Object 5: Font
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+
+    // Object 6: Encrypt dictionary (dummy - just enough to be detected)
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n<< /Filter /Standard /V 1 /R 2 /O (dummy) /U (dummy) /P -4 >>\nendobj\n");
+
+    // XRef table
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 7\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+
+    // Trailer with /Encrypt reference
+    try writer.writeAll("trailer\n");
+    try writer.writeAll("<< /Size 7 /Root 1 0 R /Encrypt 6 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+test "generate encrypted PDF" {
+    const pdf_data = try generateEncryptedPdf(std.testing.allocator);
+    defer std.testing.allocator.free(pdf_data);
+
+    try std.testing.expect(std.mem.startsWith(u8, pdf_data, "%PDF-1.4"));
+    // Should have /Encrypt in trailer
+    try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/Encrypt 6 0 R") != null);
+}
+
 test "generate incremental PDF" {
     const pdf_data = try generateIncrementalPdf(std.testing.allocator);
     defer std.testing.allocator.free(pdf_data);
