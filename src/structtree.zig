@@ -235,10 +235,13 @@ fn parseStructElement(
             }
 
             const children_slice = try children.toOwnedSlice(allocator);
+            // children is now empty; guard the owned slice against subsequent errors.
+            errdefer allocator.free(children_slice);
 
             // Heap-allocate the element so its address remains stable even as
             // the `elements` tracking list grows and its backing array is reallocated.
             const elem_ptr = try allocator.create(StructElement);
+            errdefer allocator.destroy(elem_ptr);
             elem_ptr.* = .{
                 .struct_type = struct_type,
                 .title = title,
@@ -328,8 +331,10 @@ fn parseKids(
                 }
 
                 const sub_children_slice = try sub_children.toOwnedSlice(allocator);
+                errdefer allocator.free(sub_children_slice);
 
                 const elem_ptr = try allocator.create(StructElement);
+                errdefer allocator.destroy(elem_ptr);
                 elem_ptr.* = .{
                     .struct_type = struct_type,
                     .title = title,

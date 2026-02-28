@@ -11,7 +11,8 @@ A PDF text extraction library written in Zig.
 - XRef table and stream parsing (PDF 1.5+)
 - Configurable error handling (strict or permissive)
 - Structure tree extraction for tagged PDFs (PDF/UA)
-- Fast stream order fallback for non-tagged PDFs
+- Geometric (Y→X) reading order for non-tagged PDFs
+- Markdown export for structured PDFs
 
 ## Benchmark
 
@@ -42,6 +43,7 @@ zig build test         # Run tests
 ### Library
 
 ```zig
+const std = @import("std");
 const zpdf = @import("zpdf");
 
 pub fn main() !void {
@@ -53,11 +55,12 @@ pub fn main() !void {
     defer doc.close();
 
     var buf: [4096]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&buf);
-    defer writer.interface.flush() catch {};
+    var bw = std.fs.File.stdout().writer(&buf);
+    const writer = &bw.interface;
+    defer writer.flush() catch {};
 
-    for (0..doc.pages.items.len) |page_num| {
-        try doc.extractText(page_num, &writer.interface);
+    for (0..doc.pageCount()) |page_num| {
+        try doc.extractText(page_num, writer);
     }
 }
 ```
@@ -115,6 +118,7 @@ src/
 ├── interpreter.zig  # Content stream interpreter
 ├── structtree.zig   # Structure tree parser (PDF/UA)
 ├── layout.zig       # Text layout and bounding boxes
+├── markdown.zig     # Markdown export
 └── simd.zig         # SIMD-accelerated parsing
 
 python/zpdf/         # Python bindings (cffi)
@@ -123,16 +127,19 @@ examples/            # Usage examples
 
 ## Reading Order
 
-zpdf extracts text in logical reading order using a two-tier approach:
+zpdf extracts text in logical reading order using a three-tier approach:
 
 1. **Structure Tree** (preferred): Uses the PDF's semantic structure for tagged/accessible PDFs (PDF/UA). Correctly handles multi-column layouts, sidebars, tables, and captions.
 
-2. **Stream Order** (fallback): When no structure tree exists, extracts text in PDF content stream order. This is fast and works well for most single-column documents.
+2. **Geometric Sort** (fallback): When no structure tree exists, sorts text spans by Y→X position to approximate visual reading order.
+
+3. **Stream Order** (last resort): When bounding box extraction fails, falls back to raw PDF content stream order.
 
 | Method | Pros | Cons |
 |--------|------|------|
 | Structure tree | Correct semantic order, handles complex layouts | Only works on tagged PDFs |
-| Stream order | Fast, works on any PDF | May not match visual order for complex layouts |
+| Geometric sort | Works on any PDF, respects visual layout | May fail on complex multi-column layouts |
+| Stream order | Always works | May not match visual order |
 
 ## Comparison
 
