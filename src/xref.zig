@@ -262,18 +262,18 @@ fn parseXrefStream(
     const w_array = dict.getArray("W") orelse return XRefParseError.InvalidXrefStream;
     if (w_array.len != 3) return XRefParseError.InvalidXrefStream;
 
-    const w0: usize = @intCast(switch (w_array[0]) {
-        .integer => |i| i,
+    const w0: usize = switch (w_array[0]) {
+        .integer => |i| if (i >= 0) @intCast(i) else return XRefParseError.InvalidXrefStream,
         else => 1,
-    });
-    const w1: usize = @intCast(switch (w_array[1]) {
-        .integer => |i| i,
+    };
+    const w1: usize = switch (w_array[1]) {
+        .integer => |i| if (i >= 0) @intCast(i) else return XRefParseError.InvalidXrefStream,
         else => 0,
-    });
-    const w2: usize = @intCast(switch (w_array[2]) {
-        .integer => |i| i,
+    };
+    const w2: usize = switch (w_array[2]) {
+        .integer => |i| if (i >= 0) @intCast(i) else return XRefParseError.InvalidXrefStream,
         else => 0,
-    });
+    };
 
     const entry_size = w0 + w1 + w2;
     if (entry_size == 0) return XRefParseError.InvalidXrefStream;
@@ -297,17 +297,18 @@ fn parseXrefStream(
     if (index_array) |idx| {
         var j: usize = 0;
         while (j + 1 < idx.len) : (j += 2) {
-            const start: u64 = @intCast(switch (idx[j]) {
-                .integer => |i| i,
+            const start: u64 = switch (idx[j]) {
+                .integer => |i| if (i >= 0) @intCast(i) else continue,
                 else => continue,
-            });
-            const count: u64 = @intCast(switch (idx[j + 1]) {
-                .integer => |i| i,
+            };
+            const count: u64 = switch (idx[j + 1]) {
+                .integer => |i| if (i >= 0) @intCast(i) else continue,
                 else => continue,
-            });
+            };
             ranges.append(allocator, .{ .start = start, .count = count }) catch return XRefParseError.OutOfMemory;
         }
     } else {
+        if (size < 0) return XRefParseError.InvalidXrefStream;
         ranges.append(allocator, .{ .start = 0, .count = @intCast(size) }) catch return XRefParseError.OutOfMemory;
     }
 

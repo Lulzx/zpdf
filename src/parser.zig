@@ -198,6 +198,8 @@ pub const Parser = struct {
         self.skipWhitespaceAndComments();
         _ = self.matchKeyword("endobj"); // Optional, some PDFs omit it
 
+        if (num > std.math.maxInt(u32)) return ParseError.InvalidReference;
+        if (gen > std.math.maxInt(u16)) return ParseError.InvalidReference;
         return .{
             .num = @intCast(num),
             .gen = @intCast(gen),
