@@ -45,6 +45,9 @@ pub const LayoutResult = struct {
     pub fn deinit(self: *LayoutResult) void {
         self.allocator.free(self.spans);
         for (self.lines) |line| {
+            for (line.words) |word| {
+                self.allocator.free(word.spans);
+            }
             self.allocator.free(line.words);
         }
         self.allocator.free(self.lines);
@@ -52,6 +55,9 @@ pub const LayoutResult = struct {
             self.allocator.free(col.lines);
         }
         self.allocator.free(self.columns);
+        for (self.paragraphs) |para| {
+            self.allocator.free(para.lines);
+        }
         self.allocator.free(self.paragraphs);
         self.allocator.free(self.reading_order);
     }
@@ -202,11 +208,11 @@ pub fn sortGeometric(allocator: std.mem.Allocator, spans: []const TextSpan) ![]u
 pub fn analyzeLayout(allocator: std.mem.Allocator, spans: []const TextSpan, page_width: f64) !LayoutResult {
     if (spans.len == 0) {
         return LayoutResult{
-            .spans = &.{},
-            .lines = &.{},
-            .columns = &.{},
-            .paragraphs = &.{},
-            .reading_order = &.{},
+            .spans = try allocator.alloc(TextSpan, 0),
+            .lines = try allocator.alloc(TextLine, 0),
+            .columns = try allocator.alloc(TextColumn, 0),
+            .paragraphs = try allocator.alloc(TextParagraph, 0),
+            .reading_order = try allocator.alloc(u32, 0),
             .allocator = allocator,
         };
     }
@@ -405,9 +411,18 @@ fn detectParagraphs(allocator: std.mem.Allocator, col_lines: []const TextLine, c
         if (is_para_break and para_lines.items.len > 0) {
             // Save current paragraph
             const first_indent = para_lines.items[0].bounds.x0 - avg_left_margin;
+            const para_lines_copy = try allocator.alloc(TextLine, para_lines.items.len);
+            errdefer allocator.free(para_lines_copy);
+            for (para_lines.items, 0..) |para_line, idx| {
+                para_lines_copy[idx] = .{
+                    .bounds = para_line.bounds,
+                    .words = &.{},
+                    .baseline_y = para_line.baseline_y,
+                };
+            }
             try paragraphs.append(allocator, .{
                 .bounds = mergeBounds(para_lines.items),
-                .lines = para_lines.items,
+                .lines = para_lines_copy,
                 .column_index = col_idx,
                 .first_line_indent = first_indent,
             });
@@ -420,9 +435,18 @@ fn detectParagraphs(allocator: std.mem.Allocator, col_lines: []const TextLine, c
     // Save final paragraph
     if (para_lines.items.len > 0) {
         const first_indent = para_lines.items[0].bounds.x0 - avg_left_margin;
+        const para_lines_copy = try allocator.alloc(TextLine, para_lines.items.len);
+        errdefer allocator.free(para_lines_copy);
+        for (para_lines.items, 0..) |para_line, idx| {
+            para_lines_copy[idx] = .{
+                .bounds = para_line.bounds,
+                .words = &.{},
+                .baseline_y = para_line.baseline_y,
+            };
+        }
         try paragraphs.append(allocator, .{
             .bounds = mergeBounds(para_lines.items),
-            .lines = para_lines.items,
+            .lines = para_lines_copy,
             .column_index = col_idx,
             .first_line_indent = first_indent,
         });
@@ -439,14 +463,14 @@ fn makeLine(allocator: std.mem.Allocator, spans: []const TextSpan) !TextLine {
     var prev_x1: f64 = spans[0].x0;
     for (spans) |span| {
         if (span.x0 - prev_x1 > word_gap and current_word_spans.items.len > 0) {
-            try words.append(allocator, makeWord(current_word_spans.items));
+            try words.append(allocator, try makeWord(allocator, current_word_spans.items));
             current_word_spans.clearRetainingCapacity();
         }
         try current_word_spans.append(allocator, span);
         prev_x1 = span.x1;
     }
     if (current_word_spans.items.len > 0) {
-        try words.append(allocator, makeWord(current_word_spans.items));
+        try words.append(allocator, try makeWord(allocator, current_word_spans.items));
     }
     current_word_spans.deinit(allocator);
 
@@ -458,10 +482,11 @@ fn makeLine(allocator: std.mem.Allocator, spans: []const TextSpan) !TextLine {
     };
 }
 
-fn makeWord(spans: []const TextSpan) TextWord {
+fn makeWord(allocator: std.mem.Allocator, spans: []const TextSpan) !TextWord {
+    const spans_copy = try allocator.dupe(TextSpan, spans);
     return TextWord{
         .bounds = mergeSpanBounds(spans),
-        .spans = spans,
+        .spans = spans_copy,
     };
 }
 

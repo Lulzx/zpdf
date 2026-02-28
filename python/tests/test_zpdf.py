@@ -78,6 +78,11 @@ class TestTextExtraction:
             assert isinstance(text, str)
             assert len(text) > 0
 
+    def test_extract_all_fast_mode(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            text = doc.extract_all(mode="fast")
+            assert isinstance(text, str)
+
     def test_extract_all_multiple_pages(self):
         if ACROBAT_PDF.exists():
             with zpdf.Document(ACROBAT_PDF) as doc:
@@ -102,6 +107,11 @@ class TestTextExtraction:
             text = doc.extract_page(0)
             # Just verify it returns a string (may be empty)
             assert isinstance(text, str)
+
+    def test_extract_all_invalid_mode(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            with pytest.raises(ValueError):
+                _ = doc.extract_all(mode="invalid")
 
 
 class TestTaggedPDF:
@@ -355,6 +365,13 @@ class TestDocumentLen:
         doc.close()
         with pytest.raises(ValueError, match="closed"):
             _ = len(doc)
+
+
+class TestUnsafeMemoryOpen:
+    def test_open_memory_unsafe(self):
+        data = TEST_PDF.read_bytes()
+        with zpdf.Document.open_memory_unsafe(data) as doc:
+            assert doc.page_count > 0
 
 
 class TestPageInfoRepr:

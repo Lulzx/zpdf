@@ -239,7 +239,7 @@ fn walkPageTree(
     const mediabox = extractBox(dict, "MediaBox") orelse inherited_mediabox;
     const cropbox = extractBox(dict, "CropBox") orelse inherited_cropbox;
     const rotation = @as(i32, @intCast(dict.getInt("Rotate") orelse inherited_rotation));
-    
+
     var resources = inherited_resources;
     if (dict.get("Resources")) |res_obj| {
         const resolved = switch (res_obj) {
@@ -306,7 +306,8 @@ fn extractBox(dict: Object.Dict, key: []const u8) ?[4]f64 {
 
 /// Get page content stream(s)
 pub fn getPageContents(
-    allocator: std.mem.Allocator,
+    parse_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
     data: []const u8,
     xref: *const XRefTable,
     page: Page,
@@ -314,11 +315,12 @@ pub fn getPageContents(
 ) ![]const u8 {
     const contents = page.dict.get("Contents") orelse return &[_]u8{};
 
-    return getStreamData(allocator, data, xref, contents, cache);
+    return getStreamData(parse_allocator, scratch_allocator, data, xref, contents, cache);
 }
 
 fn getStreamData(
-    allocator: std.mem.Allocator,
+    parse_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
     data: []const u8,
     xref: *const XRefTable,
     obj: Object,
@@ -326,13 +328,13 @@ fn getStreamData(
 ) ![]const u8 {
     switch (obj) {
         .reference => |ref| {
-            const resolved = try resolveRef(allocator, data, xref, ref, cache);
-            return getStreamData(allocator, data, xref, resolved, cache);
+            const resolved = try resolveRef(parse_allocator, data, xref, ref, cache);
+            return getStreamData(parse_allocator, scratch_allocator, data, xref, resolved, cache);
         },
         .stream => |s| {
             const decompress = @import("decompress.zig");
             return decompress.decompressStream(
-                allocator,
+                scratch_allocator,
                 s.data,
                 s.dict.get("Filter"),
                 s.dict.get("DecodeParms"),
@@ -341,16 +343,16 @@ fn getStreamData(
         .array => |arr| {
             // Concatenate multiple content streams
             var result: std.ArrayList(u8) = .empty;
-            errdefer result.deinit(allocator);
+            errdefer result.deinit(scratch_allocator);
 
             for (arr) |item| {
-                const stream_data = try getStreamData(allocator, data, xref, item, cache);
+                const stream_data = try getStreamData(parse_allocator, scratch_allocator, data, xref, item, cache);
                 // stream_data is arena-allocated, no need to free
-                try result.appendSlice(allocator, stream_data);
-                try result.append(allocator, '\n'); // Separate streams
+                try result.appendSlice(scratch_allocator, stream_data);
+                try result.append(scratch_allocator, '\n'); // Separate streams
             }
 
-            return result.toOwnedSlice(allocator);
+            return result.toOwnedSlice(scratch_allocator);
         },
         else => return &[_]u8{},
     }

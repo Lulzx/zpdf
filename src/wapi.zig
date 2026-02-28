@@ -39,13 +39,19 @@ export fn wasm_free(ptr: [*]u8, len: usize) void {
 
 /// Open a PDF from memory buffer
 /// Returns document handle (0-15) or -1 on error
-export fn zpdf_open_memory(data: [*]const u8, len: usize) i32 {
+/// Caller must keep the memory alive until zpdf_close.
+export fn zpdf_open_memory_unsafe(data: [*]const u8, len: usize) i32 {
     const slot = findFreeSlot() orelse return -1;
     const slice = data[0..len];
 
-    const doc = zpdf.Document.openFromMemory(wasm_allocator, slice, zpdf.ErrorConfig.default()) catch return -1;
+    const doc = zpdf.Document.openFromMemoryUnsafe(wasm_allocator, slice, zpdf.ErrorConfig.default()) catch return -1;
     documents[slot] = doc;
     return @intCast(slot);
+}
+
+/// Backward-compatible alias of zpdf_open_memory_unsafe.
+export fn zpdf_open_memory(data: [*]const u8, len: usize) i32 {
+    return zpdf_open_memory_unsafe(data, len);
 }
 
 /// Close a document and free resources
@@ -103,16 +109,28 @@ export fn zpdf_extract_all(handle: i32, out_len: *usize) ?[*]u8 {
     const idx: usize = @intCast(handle);
 
     if (documents[idx]) |doc| {
-        var buffer: std.ArrayList(u8) = .empty;
-        doc.extractAllText(buffer.writer(wasm_allocator)) catch return null;
-
-        // Handle empty buffer - toOwnedSlice returns undefined ptr for empty slice
-        if (buffer.items.len == 0) {
+        const slice = doc.extractAllTextStructured(wasm_allocator) catch return null;
+        if (slice.len == 0) {
             out_len.* = 0;
             return null;
         }
+        out_len.* = slice.len;
+        return slice.ptr;
+    }
+    return null;
+}
 
-        const slice = buffer.toOwnedSlice(wasm_allocator) catch return null;
+/// Extract text from all pages in fast stream-order mode.
+export fn zpdf_extract_all_fast(handle: i32, out_len: *usize) ?[*]u8 {
+    if (handle < 0 or handle >= MAX_DOCUMENTS) return null;
+    const idx: usize = @intCast(handle);
+
+    if (documents[idx]) |doc| {
+        const slice = doc.extractAllTextFast(wasm_allocator) catch return null;
+        if (slice.len == 0) {
+            out_len.* = 0;
+            return null;
+        }
         out_len.* = slice.len;
         return slice.ptr;
     }
@@ -186,22 +204,36 @@ export fn zpdf_extract_bounds(handle: i32, page_num: i32, out_count: *usize) ?[*
 
     if (documents[idx]) |doc| {
         const spans = doc.extractTextWithBounds(@intCast(page_num), wasm_allocator) catch return null;
+        defer zpdf.Document.freeTextSpans(wasm_allocator, spans);
         if (spans.len == 0) {
             out_count.* = 0;
             return null;
         }
 
         const c_spans = wasm_allocator.alloc(TextSpan, spans.len) catch return null;
+        var copied: usize = 0;
+        errdefer {
+            for (0..copied) |i| {
+                const span = c_spans[i];
+                if (span.text_len > 0) {
+                    const text_ptr: [*]u8 = @ptrCast(@constCast(span.text_ptr));
+                    wasm_allocator.free(text_ptr[0..span.text_len]);
+                }
+            }
+            wasm_allocator.free(c_spans);
+        }
         for (spans, 0..) |span, i| {
+            const text_copy = wasm_allocator.dupe(u8, span.text) catch return null;
             c_spans[i] = .{
                 .x0 = span.x0,
                 .y0 = span.y0,
                 .x1 = span.x1,
                 .y1 = span.y1,
-                .text_ptr = span.text.ptr,
-                .text_len = span.text.len,
+                .text_ptr = text_copy.ptr,
+                .text_len = text_copy.len,
                 .font_size = span.font_size,
             };
+            copied = i + 1;
         }
 
         out_count.* = spans.len;
@@ -213,6 +245,13 @@ export fn zpdf_extract_bounds(handle: i32, page_num: i32, out_count: *usize) ?[*
 /// Free bounds array
 export fn zpdf_free_bounds(ptr: ?[*]TextSpan, count: usize) void {
     if (ptr) |p| {
+        for (0..count) |i| {
+            const span = p[i];
+            if (span.text_len > 0) {
+                const text_ptr: [*]u8 = @ptrCast(@constCast(span.text_ptr));
+                wasm_allocator.free(text_ptr[0..span.text_len]);
+            }
+        }
         wasm_allocator.free(p[0..count]);
     }
 }

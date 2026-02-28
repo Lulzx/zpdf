@@ -14,10 +14,17 @@ export fn zpdf_open(path_ptr: [*:0]const u8) ?*ZpdfDocument {
     return @ptrCast(doc);
 }
 
-export fn zpdf_open_memory(data: [*]const u8, len: usize) ?*ZpdfDocument {
+/// Open from caller-owned memory without copying.
+/// The caller must ensure the memory remains valid until zpdf_close.
+export fn zpdf_open_memory_unsafe(data: [*]const u8, len: usize) ?*ZpdfDocument {
     const slice = data[0..len];
-    const doc = zpdf.Document.openFromMemory(c_allocator, slice, zpdf.ErrorConfig.default()) catch return null;
+    const doc = zpdf.Document.openFromMemoryUnsafe(c_allocator, slice, zpdf.ErrorConfig.default()) catch return null;
     return @ptrCast(doc);
+}
+
+/// Backward-compatible alias of zpdf_open_memory_unsafe.
+export fn zpdf_open_memory(data: [*]const u8, len: usize) ?*ZpdfDocument {
+    return zpdf_open_memory_unsafe(data, len);
 }
 
 export fn zpdf_close(handle: ?*ZpdfDocument) void {
@@ -54,6 +61,17 @@ export fn zpdf_extract_page(handle: ?*ZpdfDocument, page_num: c_int, out_len: *u
 /// Uses structure tree when available, falls back to geometric sorting
 export fn zpdf_extract_all(handle: ?*ZpdfDocument, out_len: *usize) ?[*]u8 {
     return zpdf_extract_all_reading_order(handle, out_len);
+}
+
+/// Extract all pages in fast stream-order mode.
+export fn zpdf_extract_all_fast(handle: ?*ZpdfDocument, out_len: *usize) ?[*]u8 {
+    if (handle) |h| {
+        const doc: *zpdf.Document = @ptrCast(@alignCast(h));
+        const result = doc.extractAllTextFast(c_allocator) catch return null;
+        out_len.* = result.len;
+        return result.ptr;
+    }
+    return null;
 }
 
 /// Alias for zpdf_extract_all (parallel is deprecated, uses sequential)
@@ -97,22 +115,36 @@ export fn zpdf_extract_bounds(handle: ?*ZpdfDocument, page_num: c_int, out_count
         if (page_num < 0) return null;
 
         const spans = doc.extractTextWithBounds(@intCast(page_num), c_allocator) catch return null;
+        defer zpdf.Document.freeTextSpans(c_allocator, spans);
         if (spans.len == 0) {
             out_count.* = 0;
             return null;
         }
 
         const c_spans = c_allocator.alloc(CTextSpan, spans.len) catch return null;
+        var copied: usize = 0;
+        errdefer {
+            for (0..copied) |i| {
+                const span = c_spans[i];
+                if (span.text_len > 0) {
+                    const ptr: [*]u8 = @ptrCast(@constCast(span.text));
+                    c_allocator.free(ptr[0..span.text_len]);
+                }
+            }
+            c_allocator.free(c_spans);
+        }
         for (spans, 0..) |span, i| {
+            const text_copy = c_allocator.dupe(u8, span.text) catch return null;
             c_spans[i] = .{
                 .x0 = span.x0,
                 .y0 = span.y0,
                 .x1 = span.x1,
                 .y1 = span.y1,
-                .text = span.text.ptr,
-                .text_len = span.text.len,
+                .text = text_copy.ptr,
+                .text_len = text_copy.len,
                 .font_size = span.font_size,
             };
+            copied = i + 1;
         }
 
         out_count.* = spans.len;
@@ -123,6 +155,13 @@ export fn zpdf_extract_bounds(handle: ?*ZpdfDocument, page_num: c_int, out_count
 
 export fn zpdf_free_bounds(ptr: ?[*]CTextSpan, count: usize) void {
     if (ptr) |p| {
+        for (0..count) |i| {
+            const span = p[i];
+            if (span.text_len > 0) {
+                const text_ptr: [*]u8 = @ptrCast(@constCast(span.text));
+                c_allocator.free(text_ptr[0..span.text_len]);
+            }
+        }
         c_allocator.free(p[0..count]);
     }
 }
@@ -143,7 +182,7 @@ export fn zpdf_extract_page_reading_order(handle: ?*ZpdfDocument, page_num: c_in
             out_len.* = 0;
             return null;
         }
-        defer c_allocator.free(spans);
+        defer zpdf.Document.freeTextSpans(c_allocator, spans);
 
         // Analyze layout for reading order
         var layout_result = zpdf.layout.analyzeLayout(c_allocator, spans, page_width) catch return null;

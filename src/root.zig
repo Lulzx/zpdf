@@ -40,6 +40,7 @@ pub const StructTree = structtree.StructTree;
 pub const StructElement = structtree.StructElement;
 pub const MarkdownOptions = markdown.MarkdownOptions;
 pub const MarkdownRenderer = markdown.MarkdownRenderer;
+pub const FullTextMode = enum { accuracy, fast };
 
 /// Error handling configuration
 pub const ErrorConfig = struct {
@@ -226,8 +227,9 @@ pub const Document = struct {
         return doc;
     }
 
-    /// Open a PDF from memory buffer (not owned)
-    pub fn openFromMemory(allocator: std.mem.Allocator, data: []const u8, config: ErrorConfig) !*Document {
+    /// Open a PDF from caller-owned memory without copying.
+    /// Caller must keep the memory alive until close().
+    pub fn openFromMemoryUnsafe(allocator: std.mem.Allocator, data: []const u8, config: ErrorConfig) !*Document {
         const doc = try allocator.create(Document);
         errdefer allocator.destroy(doc);
 
@@ -248,6 +250,11 @@ pub const Document = struct {
 
         try doc.parseDocument();
         return doc;
+    }
+
+    /// Backward-compatible alias of openFromMemoryUnsafe.
+    pub fn openFromMemory(allocator: std.mem.Allocator, data: []const u8, config: ErrorConfig) !*Document {
+        return openFromMemoryUnsafe(allocator, data, config);
     }
 
     fn parseDocument(self: *Document) !void {
@@ -431,6 +438,17 @@ pub const Document = struct {
         return self.pages.items.len;
     }
 
+    /// Free spans returned by extractTextWithBounds, including owned text.
+    pub fn freeTextSpans(allocator: std.mem.Allocator, spans: []TextSpan) void {
+        if (spans.len == 0) return;
+        for (spans) |span| {
+            if (span.text.len > 0) {
+                allocator.free(@constCast(span.text));
+            }
+        }
+        allocator.free(spans);
+    }
+
     /// Resolve an object reference
     pub fn resolve(self: *Document, ref: ObjRef) !Object {
         return pagetree.resolveRef(
@@ -447,11 +465,15 @@ pub const Document = struct {
         if (page_num >= self.pages.items.len) return error.PageNotFound;
 
         const page = self.pages.items[page_num];
-        const arena = self.parsing_arena.allocator();
+        const parse_allocator = self.parsing_arena.allocator();
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch_allocator = scratch_arena.allocator();
 
         // Get content stream (allocated from arena, no need to free)
         const content = pagetree.getPageContents(
-            arena,
+            parse_allocator,
+            scratch_allocator,
             self.data,
             &self.xref_table,
             page,
@@ -476,7 +498,8 @@ pub const Document = struct {
 
         // Extract text with full Form XObject support
         const ctx = ExtractionContext{
-            .allocator = arena,
+            .parse_allocator = parse_allocator,
+            .scratch_allocator = scratch_allocator,
             .data = self.data,
             .xref_table = &self.xref_table,
             .object_cache = &self.object_cache,
@@ -500,10 +523,14 @@ pub const Document = struct {
         if (page_num >= self.pages.items.len) return error.PageNotFound;
 
         const page = self.pages.items[page_num];
-        const arena = self.parsing_arena.allocator();
+        const parse_allocator = self.parsing_arena.allocator();
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch_allocator = scratch_arena.allocator();
 
         const content = pagetree.getPageContents(
-            arena,
+            parse_allocator,
+            scratch_allocator,
             self.data,
             &self.xref_table,
             page,
@@ -520,11 +547,13 @@ pub const Document = struct {
 
         {
             var nw: NullWriter = .{};
-            try extractContentStream(content, .{ .bounds = &collector }, &self.font_cache, page_num, collector.allocator, &nw);
+            try extractContentStream(content, .{ .bounds = &collector }, &self.font_cache, page_num, scratch_allocator, &nw);
         }
         try collector.flush();
 
-        return collector.spans.toOwnedSlice(collector.allocator);
+        const spans = try collector.toOwnedSlice();
+        collector.deinit();
+        return spans;
     }
 
     /// Analyze page layout (columns, paragraphs, reading order)
@@ -612,12 +641,16 @@ pub const Document = struct {
         // Ensure reading order is cached (done once per document)
         self.ensureReadingOrder();
 
-        const arena = self.parsing_arena.allocator();
+        const parse_allocator = self.parsing_arena.allocator();
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch_allocator = scratch_arena.allocator();
         const page = self.pages.items[page_num];
 
         // Get content stream
         const content = pagetree.getPageContents(
-            arena,
+            parse_allocator,
+            scratch_allocator,
             self.data,
             &self.xref_table,
             page,
@@ -633,12 +666,12 @@ pub const Document = struct {
         if (self.cached_reading_order) |*cache| {
             if (cache.get(page_num)) |mcids| {
                 // Extract text with MCID tracking
-                var extractor = structtree.MarkedContentExtractor.init(allocator);
+                var extractor = structtree.MarkedContentExtractor.init(scratch_allocator);
                 defer extractor.deinit();
 
                 {
                     var nw: NullWriter = .{};
-                    extractContentStream(content, .{ .structured = &extractor }, &self.font_cache, page_num, arena, &nw) catch
+                    extractContentStream(content, .{ .structured = &extractor }, &self.font_cache, page_num, scratch_allocator, &nw) catch
                         return self.extractTextGeometric(page_num, allocator);
                 }
 
@@ -671,17 +704,21 @@ pub const Document = struct {
     /// Extract text using geometric sorting (fallback when no structure tree)
     /// Simple Y→X sort to match PyMuPDF's sort=True behavior
     fn extractTextGeometric(self: *Document, page_num: usize, allocator: std.mem.Allocator) ![]u8 {
-        const spans = self.extractTextWithBounds(page_num, allocator) catch |err| {
+        // Keep intermediate span allocations in per-call scratch memory to avoid
+        // persistent allocator churn on repeated full-document extraction.
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch_allocator = scratch_arena.allocator();
+
+        const spans = self.extractTextWithBounds(page_num, scratch_allocator) catch |err| {
             // If bounds extraction fails, fall back to stream order
             if (err == error.OutOfMemory) return err;
             return self.extractTextStreamOrder(page_num, allocator);
         };
 
         if (spans.len == 0) {
-            allocator.free(spans);
             return allocator.alloc(u8, 0);
         }
-        defer allocator.free(spans);
 
         return layout.sortGeometric(allocator, spans) catch {
             return self.extractTextStreamOrder(page_num, allocator);
@@ -695,12 +732,15 @@ pub const Document = struct {
         // Pre-size for typical page: ~2KB of text
         try output.ensureTotalCapacity(allocator, 2048);
 
-        const arena = self.parsing_arena.allocator();
+        const parse_allocator = self.parsing_arena.allocator();
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch_allocator = scratch_arena.allocator();
         const page = self.pages.items[page_num];
-        const content = pagetree.getPageContents(arena, self.data, &self.xref_table, page, &self.object_cache) catch return output.toOwnedSlice(allocator);
+        const content = pagetree.getPageContents(parse_allocator, scratch_allocator, self.data, &self.xref_table, page, &self.object_cache) catch return output.toOwnedSlice(allocator);
 
         self.ensurePageFonts(page_num);
-        try extractTextFromContent(arena, content, page_num, &self.font_cache, output.writer(allocator));
+        try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, output.writer(allocator));
         return output.toOwnedSlice(allocator);
     }
 
@@ -719,87 +759,76 @@ pub const Document = struct {
             }
         }
 
-        // Check if we have any structure tree data with actual entries
-        const has_structure = if (self.cached_reading_order) |cache| cache.count() > 0 else false;
-
-        // For documents without structure tree, use fast stream order
-        if (!has_structure) {
-            var result: std.ArrayList(u8) = .empty;
-            errdefer result.deinit(allocator);
-            // Pre-size buffer: ~2KB average text per page
-            try result.ensureTotalCapacity(allocator, num_pages * 2048);
-
-            const arena = self.parsing_arena.allocator();
-            for (0..num_pages) |page_num| {
-                if (page_num > 0) try result.append(allocator, '\x0c');
-                const page = self.pages.items[page_num];
-                const content = pagetree.getPageContents(arena, self.data, &self.xref_table, page, &self.object_cache) catch continue;
-                if (content.len > 0) {
-                    try extractTextFromContent(arena, content, page_num, &self.font_cache, result.writer(allocator));
-                }
-            }
-            return result.toOwnedSlice(allocator);
-        }
-
-        // Sequential extraction with structure tree
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
         // Pre-size buffer: ~2KB average text per page
         try result.ensureTotalCapacity(allocator, num_pages * 2048);
 
-        const arena = self.parsing_arena.allocator();
-
         for (0..num_pages) |page_num| {
             if (page_num > 0) try result.append(allocator, '\x0c'); // Form feed
+            // Keep per-page extraction intermediates off the caller allocator.
+            {
+                var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer scratch_arena.deinit();
+                const scratch_allocator = scratch_arena.allocator();
 
-            const page = self.pages.items[page_num];
-
-            // Get content stream
-            const content = pagetree.getPageContents(
-                arena,
-                self.data,
-                &self.xref_table,
-                page,
-                &self.object_cache,
-            ) catch continue;
-
-            if (content.len == 0) continue;
-
-            // Check if we have cached reading order for this page
-            var used_structure = false;
-            if (self.cached_reading_order) |*cache| {
-                if (cache.get(page_num)) |mcids| {
-                    // Extract text with MCID tracking
-                    var extractor = structtree.MarkedContentExtractor.init(allocator);
-                    defer extractor.deinit();
-
-                    var nw: NullWriter = .{};
-                    const extract_ok = extractContentStream(content, .{ .structured = &extractor }, &self.font_cache, page_num, arena, &nw);
-                    if (extract_ok) |_| {
-                        // Collect text in structure tree order
-                        const start_len = result.items.len;
-                        for (mcids.items) |mcr| {
-                            if (extractor.getTextForMcid(mcr.mcid)) |text| {
-                                if (result.items.len > start_len and text.len > 0 and result.items[result.items.len - 1] != '\x0c') {
-                                    try result.append(allocator, ' ');
-                                }
-                                try result.appendSlice(allocator, text);
-                            }
-                        }
-                        if (result.items.len > start_len) {
-                            used_structure = true;
-                        }
-                    } else |_| {}
-                }
-            }
-
-            // Fall back to stream order if structure tree didn't produce text
-            if (!used_structure) {
-                try extractTextFromContent(arena, content, page_num, &self.font_cache, result.writer(allocator));
+                const page_text = self.extractTextStructured(page_num, scratch_allocator) catch continue;
+                try result.appendSlice(allocator, page_text);
             }
         }
 
         return result.toOwnedSlice(allocator);
+    }
+
+    /// Extract text from all pages in fast stream-order mode.
+    pub fn extractAllTextFast(self: *Document, allocator: std.mem.Allocator) ![]u8 {
+        const num_pages = self.pages.items.len;
+        if (num_pages == 0) return allocator.alloc(u8, 0);
+
+        // Pre-load fonts for smaller docs to reduce per-page overhead.
+        if (num_pages <= 100) {
+            for (0..num_pages) |i| {
+                self.ensurePageFonts(i);
+            }
+        }
+
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+        try result.ensureTotalCapacity(allocator, num_pages * 2048);
+
+        const parse_allocator = self.parsing_arena.allocator();
+
+        for (0..num_pages) |page_num| {
+            if (page_num > 0) try result.append(allocator, '\x0c');
+            {
+                var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer scratch_arena.deinit();
+                const scratch_allocator = scratch_arena.allocator();
+
+                const page = self.pages.items[page_num];
+                const content = pagetree.getPageContents(
+                    parse_allocator,
+                    scratch_allocator,
+                    self.data,
+                    &self.xref_table,
+                    page,
+                    &self.object_cache,
+                ) catch continue;
+
+                if (content.len == 0) continue;
+                self.ensurePageFonts(page_num);
+                try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, result.writer(allocator));
+            }
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    pub fn extractAllTextWithMode(self: *Document, allocator: std.mem.Allocator, mode: FullTextMode) ![]u8 {
+        return switch (mode) {
+            .accuracy => self.extractAllTextStructured(allocator),
+            .fast => self.extractAllTextFast(allocator),
+        };
     }
 
     /// Extract text from a page as Markdown
@@ -822,10 +851,10 @@ pub const Document = struct {
         // Extract spans with bounds
         const spans = try self.extractTextWithBounds(page_num, allocator);
         if (spans.len == 0) {
-            allocator.free(spans);
+            Document.freeTextSpans(allocator, spans);
             return allocator.alloc(u8, 0);
         }
-        defer allocator.free(spans);
+        defer Document.freeTextSpans(allocator, spans);
 
         // Render to Markdown
         var renderer = markdown.MarkdownRenderer.init(allocator, options);
@@ -887,7 +916,8 @@ pub const Document = struct {
 
 /// Context for text extraction (allows Form XObject recursion)
 const ExtractionContext = struct {
-    allocator: std.mem.Allocator,
+    parse_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
     data: []const u8,
     xref_table: *const XRefTable,
     object_cache: *std.AutoHashMap(u32, Object),
@@ -986,7 +1016,7 @@ fn extractTextFromContentFull(
     try extractContentStream(content, .{ .stream = .{
         .resources = resources,
         .ctx = ctx,
-    } }, ctx.font_cache, ctx.page_num, ctx.allocator, writer);
+    } }, ctx.font_cache, ctx.page_num, ctx.scratch_allocator, writer);
 }
 
 /// Unified content stream extraction. All three extraction paths go through this.
@@ -1030,7 +1060,7 @@ fn extractContentStream(
                     if (std.mem.eql(u8, op, "BDC")) {
                         if (operand_count >= 2) {
                             const tag = operands[0].asName() orelse "Unknown";
-                            const mcid = extractMcidFromDict(operands[1]);
+                            const mcid = extractMcidFromOperands(operands[0..operand_count], 1);
                             try extractor.beginMarkedContent(tag, mcid);
                         }
                     } else if (std.mem.eql(u8, op, "BMC")) {
@@ -1199,7 +1229,7 @@ fn handleDoOperator(
     const xobjects = switch (xobjects_obj) {
         .dict => |d| d,
         .reference => |ref| blk: {
-            const resolved = pagetree.resolveRef(ctx.allocator, ctx.data, ctx.xref_table, ref, @constCast(ctx.object_cache)) catch return;
+            const resolved = pagetree.resolveRef(ctx.parse_allocator, ctx.data, ctx.xref_table, ref, @constCast(ctx.object_cache)) catch return;
             break :blk switch (resolved) {
                 .dict => |d| d,
                 else => return,
@@ -1213,7 +1243,7 @@ fn handleDoOperator(
     const xobj_resolved = switch (xobj) {
         .stream => |s| s,
         .reference => |ref| blk: {
-            const resolved = pagetree.resolveRef(ctx.allocator, ctx.data, ctx.xref_table, ref, @constCast(ctx.object_cache)) catch return;
+            const resolved = pagetree.resolveRef(ctx.parse_allocator, ctx.data, ctx.xref_table, ref, @constCast(ctx.object_cache)) catch return;
             break :blk switch (resolved) {
                 .stream => |s| s,
                 else => return,
@@ -1229,15 +1259,16 @@ fn handleDoOperator(
     // Decompress the Form XObject content
     const filter = xobj_resolved.dict.get("Filter");
     const params = xobj_resolved.dict.get("DecodeParms");
-    const form_content = decompress.decompressStream(ctx.allocator, xobj_resolved.data, filter, params) catch return;
-    defer ctx.allocator.free(form_content);
+    const form_content = decompress.decompressStream(ctx.scratch_allocator, xobj_resolved.data, filter, params) catch return;
+    defer ctx.scratch_allocator.free(form_content);
 
     // Get Form XObject's own resources (may inherit from parent)
     const form_resources = xobj_resolved.dict.getDict("Resources") orelse resources;
 
     // Recursively extract text with increased depth
     const child_ctx = ExtractionContext{
-        .allocator = ctx.allocator,
+        .parse_allocator = ctx.parse_allocator,
+        .scratch_allocator = ctx.scratch_allocator,
         .data = ctx.data,
         .xref_table = ctx.xref_table,
         .object_cache = ctx.object_cache,
@@ -1249,7 +1280,7 @@ fn handleDoOperator(
     extractContentStream(form_content, .{ .stream = .{
         .resources = form_resources,
         .ctx = &child_ctx,
-    } }, ctx.font_cache, ctx.page_num, ctx.allocator, writer) catch {};
+    } }, ctx.font_cache, ctx.page_num, ctx.scratch_allocator, writer) catch {};
 }
 
 fn writeTextWithFont(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, writer: anytype) !void {
@@ -1341,6 +1372,28 @@ fn extractMcidFromDict(operand: interpreter.Operand) ?i32 {
             }
         },
         else => {},
+    }
+    return null;
+}
+
+/// Extract MCID from flattened BDC operands.
+/// Supports:
+/// 1. Array-shaped dictionary tokens
+/// 2. Flattened name/value token pairs (... /MCID 12 ...)
+fn extractMcidFromOperands(operands: []const interpreter.Operand, property_start: usize) ?i32 {
+    if (property_start >= operands.len) return null;
+
+    // First try existing array-based extraction on the property operand.
+    if (extractMcidFromDict(operands[property_start])) |mcid| return mcid;
+
+    // Fallback: scan flattened key/value pairs.
+    var i = property_start;
+    while (i + 1 < operands.len) : (i += 1) {
+        if (operands[i] == .name and std.mem.eql(u8, operands[i].name, "MCID")) {
+            if (operands[i + 1] == .number) {
+                return @intFromFloat(operands[i + 1].number);
+            }
+        }
     }
     return null;
 }

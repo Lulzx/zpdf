@@ -55,12 +55,13 @@ def extract_zpdf(pdf_path: str, reading_order: bool = True) -> tuple:
 
     Args:
         pdf_path: Path to PDF file
-        reading_order: If True (default), use reading order (visual order).
-                      If False, use stream order (faster but may not match visual layout).
+        reading_order: If True (default), use accuracy mode.
+                      If False, use fast mode.
     """
     start = time.perf_counter()
     doc = zpdf.Document(pdf_path)
-    text = doc.extract_all(parallel=True, reading_order=reading_order)
+    mode = "accuracy" if reading_order else "fast"
+    text = doc.extract_all(mode=mode)
     pages = doc.page_count
     doc.close()
     elapsed = (time.perf_counter() - start) * 1000

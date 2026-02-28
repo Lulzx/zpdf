@@ -265,31 +265,28 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
                 }
             },
             .json, .text => {
-                switch (extraction_mode) {
-                    .normal => {
-                        // Structure tree reading order (falls back to stream order)
-                        const text = doc.extractTextStructured(page_num, allocator) catch |err| {
-                            std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-                            continue;
-                        };
-                        defer allocator.free(text);
-                        try writer.writeAll(text);
+                const text = switch (extraction_mode) {
+                    // Structure tree reading order (falls back to geometric order)
+                    .normal => doc.extractTextStructured(page_num, allocator) catch |err| {
+                        std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
+                        continue;
                     },
-                    .visual => {
-                        // Visual reading order extraction
-                        const text = extractPageReadingOrder(doc, page_num, allocator) catch |err| {
-                            std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-                            continue;
-                        };
-                        defer allocator.free(text);
-                        try writer.writeAll(text);
+                    // Visual reading order extraction
+                    .visual => extractPageReadingOrder(doc, page_num, allocator) catch |err| {
+                        std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
+                        continue;
                     },
-                }
+                };
+                defer allocator.free(text);
 
                 if (output_format == .json) {
+                    try writeJsonEscapedString(writer, text);
                     try writer.writeAll("\"}");
                 } else if (idx + 1 < pages.len) {
+                    try writer.writeAll(text);
                     try writer.writeByte('\x0c'); // Form feed between pages
+                } else {
+                    try writer.writeAll(text);
                 }
             },
         }
@@ -297,6 +294,27 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
 
     if (output_format == .json) {
         try writer.writeAll("\n  ]\n}\n");
+    }
+}
+
+fn writeJsonEscapedString(writer: anytype, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            '\x08' => try writer.writeAll("\\b"),
+            '\x0c' => try writer.writeAll("\\f"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u00{X:0>2}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
     }
 }
 
@@ -309,7 +327,7 @@ fn extractPageReadingOrder(doc: *zpdf.Document, page_num: usize, allocator: std.
     if (spans.len == 0) {
         return allocator.alloc(u8, 0);
     }
-    defer allocator.free(spans);
+    defer zpdf.Document.freeTextSpans(allocator, spans);
 
     var layout_result = try zpdf.layout.analyzeLayout(allocator, spans, page_width);
     defer layout_result.deinit();
@@ -351,7 +369,7 @@ fn extractAllTextReadingOrderParallel(doc: *zpdf.Document, allocator: std.mem.Al
 
                 const spans = c.doc.extractTextWithBounds(page_idx, c.alloc) catch continue;
                 if (spans.len == 0) continue;
-                defer c.alloc.free(spans);
+                defer zpdf.Document.freeTextSpans(c.alloc, spans);
 
                 var layout_result = zpdf.layout.analyzeLayout(c.alloc, spans, page_width) catch continue;
                 defer layout_result.deinit();

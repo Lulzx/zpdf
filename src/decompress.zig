@@ -136,7 +136,7 @@ fn decodeFlateDecode(
 
     // Read all decompressed data using allocating writer
     var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
+    defer aw.deinit();
 
     _ = decomp.reader.streamRemaining(&aw.writer) catch |err| {
         // Some PDFs have truncated streams - try to use what we have
@@ -183,8 +183,6 @@ fn decodeFlateDecode(
                     colors,
                     bits,
                 );
-
-                aw.deinit();
                 return unpredicted;
             }
         }

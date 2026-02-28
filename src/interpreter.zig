@@ -411,6 +411,11 @@ pub const SpanCollector = struct {
     }
 
     pub fn deinit(self: *SpanCollector) void {
+        for (self.spans.items) |span| {
+            if (span.text.len > 0) {
+                self.allocator.free(@constCast(span.text));
+            }
+        }
         self.spans.deinit(self.allocator);
         self.text_buffer.deinit(self.allocator);
     }

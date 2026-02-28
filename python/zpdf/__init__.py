@@ -46,13 +46,17 @@ class PageInfo:
 
 
 class Document:
-    __slots__ = ("_handle", "_closed")
+    __slots__ = ("_handle", "_closed", "_unsafe_buffer")
 
     def __init__(self, source: Union[str, Path, bytes]):
         self._closed = False
+        self._handle = ffi.NULL
+        self._unsafe_buffer = None
 
         if isinstance(source, bytes):
-            self._handle = lib.zpdf_open_memory(source, len(source))
+            # Zero-copy path: keep a cffi buffer alive for the document lifetime.
+            self._unsafe_buffer = ffi.from_buffer(source)
+            self._handle = lib.zpdf_open_memory_unsafe(self._unsafe_buffer, len(source))
         else:
             path = str(source).encode("utf-8")
             self._handle = lib.zpdf_open(path)
@@ -74,7 +78,17 @@ class Document:
         if not self._closed and self._handle != ffi.NULL:
             lib.zpdf_close(self._handle)
             self._handle = ffi.NULL
+            self._unsafe_buffer = None
             self._closed = True
+
+    @classmethod
+    def open_memory_unsafe(cls, data: bytes) -> "Document":
+        """Open a PDF from an in-memory byte buffer without copying.
+
+        The returned document keeps a reference to the provided buffer and
+        reads directly from it.
+        """
+        return cls(data)
 
     def _check_open(self) -> None:
         if self._closed:
@@ -130,15 +144,22 @@ class Document:
         finally:
             lib.zpdf_free_buffer(buf_ptr, out_len[0])
 
-    def extract_all(self) -> str:
-        """Extract text from all pages in reading order.
+    def extract_all(self, mode: str = "accuracy") -> str:
+        """Extract text from all pages.
 
-        Uses structure tree when available, falls back to geometric sorting (Y→X).
+        Args:
+            mode: Extraction mode.
+                - "accuracy" (default): structure-tree order, geometric fallback.
+                - "fast": high-throughput stream-order extraction.
         """
         self._check_open()
         out_len = ffi.new("size_t*")
-
-        buf_ptr = lib.zpdf_extract_all_reading_order(self._handle, out_len)
+        if mode == "accuracy":
+            buf_ptr = lib.zpdf_extract_all_reading_order(self._handle, out_len)
+        elif mode == "fast":
+            buf_ptr = lib.zpdf_extract_all_fast(self._handle, out_len)
+        else:
+            raise ValueError("mode must be 'accuracy' or 'fast'")
 
         if buf_ptr == ffi.NULL:
             if out_len[0] == 0:

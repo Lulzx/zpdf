@@ -86,12 +86,19 @@ with zpdf.Document("file.pdf") as doc:
     # Single page
     text = doc.extract_page(0)
 
-    # All pages (reading order by default)
+    # All pages (accuracy mode is default)
     all_text = doc.extract_all()
+
+    # Fast mode (higher throughput, stream-order extraction)
+    fast_text = doc.extract_all(mode="fast")
 
     # Page info
     info = doc.get_page_info(0)
     print(f"{info.width}x{info.height}")
+
+# Zero-copy memory open (unsafe semantics for other language bindings)
+with zpdf.Document.open_memory_unsafe(open("file.pdf", "rb").read()) as doc:
+    print(doc.page_count)
 ```
 
 Build the shared library first:

@@ -43,3 +43,17 @@ PYTHONPATH=../python python3 accuracy.py
 ```
 
 Requires `pypdfium2`: `pip install pypdfium2`
+
+## Memory Regression Guard
+
+Check repeated full-document extraction for accuracy-mode memory regressions.
+
+```bash
+PYTHONPATH=../python python3 memory_guard.py --pdf docs/pdf_reference.pdf
+```
+
+If you want this check in pytest as well, run:
+
+```bash
+ZPDF_RUN_MEMORY_GUARDS=1 PYTHONPATH=python python3 -m pytest -q python/tests/test_memory_regression.py
+```
