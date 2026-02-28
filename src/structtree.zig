@@ -54,15 +54,15 @@ pub const MarkedContentRef = struct {
 pub const StructTree = struct {
     /// Root element (typically /Document)
     root: ?*const StructElement,
-    /// All elements (for memory management)
-    elements: []const StructElement,
+    /// All elements as individual heap allocations (stable pointers, used for cleanup)
+    elements: []*StructElement,
     /// Allocator used
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *StructTree) void {
-        // Elements contain slices that were allocated
         for (self.elements) |elem| {
             self.allocator.free(elem.children);
+            self.allocator.destroy(elem);
         }
         self.allocator.free(self.elements);
     }
@@ -80,19 +80,24 @@ pub const StructTree = struct {
         }
 
         if (self.root) |root| {
-            try collectMcidsInOrder(root, &result, allocator, null);
+            try collectMcidsInOrder(root, &result, allocator, null, 0);
         }
 
         return result;
     }
 };
 
+const MAX_STRUCT_DEPTH: u32 = 256;
+
 fn collectMcidsInOrder(
     elem: *const StructElement,
     result: *std.AutoHashMap(usize, std.ArrayList(MarkedContentRef)),
     allocator: std.mem.Allocator,
     parent_page: ?ObjRef,
+    depth: u32,
 ) !void {
+    if (depth >= MAX_STRUCT_DEPTH) return;
+
     // Skip artifacts - they're not part of reading order
     if (std.mem.eql(u8, elem.struct_type, "Artifact")) return;
 
@@ -101,7 +106,7 @@ fn collectMcidsInOrder(
     for (elem.children) |child| {
         switch (child) {
             .element => |sub_elem| {
-                try collectMcidsInOrder(sub_elem, result, allocator, current_page);
+                try collectMcidsInOrder(sub_elem, result, allocator, current_page, depth + 1);
             },
             .mcid => |mcr| {
                 const page_ref = mcr.page_ref orelse current_page;
@@ -156,11 +161,14 @@ pub fn parseStructTree(
         else => return emptyTree(allocator),
     };
 
-    // Parse the tree starting from /K
-    var elements: std.ArrayList(StructElement) = .empty;
+    // Parse the tree starting from /K.
+    // Elements are individually heap-allocated so that pointers stored in
+    // StructChild.element remain stable even as the tracking list grows.
+    var elements: std.ArrayList(*StructElement) = .empty;
     errdefer {
         for (elements.items) |elem| {
             allocator.free(elem.children);
+            allocator.destroy(elem);
         }
         elements.deinit(allocator);
     }
@@ -191,7 +199,7 @@ fn parseStructElement(
     xref: *const XRefTable,
     cache: *std.AutoHashMap(u32, Object),
     obj: Object,
-    elements: *std.ArrayList(StructElement),
+    elements: *std.ArrayList(*StructElement),
 ) !?*const StructElement {
     // Resolve if reference
     const resolved = switch (obj) {
@@ -228,15 +236,18 @@ fn parseStructElement(
 
             const children_slice = try children.toOwnedSlice(allocator);
 
-            try elements.append(allocator, .{
+            // Heap-allocate the element so its address remains stable even as
+            // the `elements` tracking list grows and its backing array is reallocated.
+            const elem_ptr = try allocator.create(StructElement);
+            elem_ptr.* = .{
                 .struct_type = struct_type,
                 .title = title,
                 .alt_text = alt,
                 .children = children_slice,
                 .page_ref = page_ref,
-            });
-
-            return &elements.items[elements.items.len - 1];
+            };
+            try elements.append(allocator, elem_ptr);
+            return elem_ptr;
         },
         .integer => |mcid| {
             // Direct MCID - shouldn't happen at top level but handle it
@@ -254,7 +265,7 @@ fn parseKids(
     cache: *std.AutoHashMap(u32, Object),
     kids_obj: Object,
     children: *std.ArrayList(StructChild),
-    elements: *std.ArrayList(StructElement),
+    elements: *std.ArrayList(*StructElement),
     parent_page: ?ObjRef,
 ) !void {
     switch (kids_obj) {
@@ -318,17 +329,16 @@ fn parseKids(
 
                 const sub_children_slice = try sub_children.toOwnedSlice(allocator);
 
-                try elements.append(allocator, .{
+                const elem_ptr = try allocator.create(StructElement);
+                elem_ptr.* = .{
                     .struct_type = struct_type,
                     .title = title,
                     .alt_text = alt,
                     .children = sub_children_slice,
                     .page_ref = page_ref,
-                });
-
-                try children.append(allocator, .{
-                    .element = &elements.items[elements.items.len - 1],
-                });
+                };
+                try elements.append(allocator, elem_ptr);
+                try children.append(allocator, .{ .element = elem_ptr });
             }
         },
         else => {},
