@@ -295,7 +295,7 @@ pub const Parser = struct {
                         while (count < 3 and self.pos < self.data.len) {
                             const oc = self.data[self.pos];
                             if (oc >= '0' and oc <= '7') {
-                                octal = octal * 8 + (oc - '0');
+                                octal = octal *% 8 +% (oc - '0');
                                 self.pos += 1;
                                 count += 1;
                             } else break;

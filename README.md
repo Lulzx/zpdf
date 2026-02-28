@@ -53,11 +53,12 @@ pub fn main() !void {
     defer doc.close();
 
     var buf: [4096]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&buf);
-    defer writer.interface.flush() catch {};
+    var bw = std.fs.File.stdout().writer(&buf);
+    const writer = &bw.interface;
+    defer writer.flush() catch {};
 
-    for (0..doc.pages.items.len) |page_num| {
-        try doc.extractText(page_num, &writer.interface);
+    for (0..doc.pageCount()) |page_num| {
+        try doc.extractText(page_num, writer);
     }
 }
 ```
