@@ -432,6 +432,296 @@ class TestTaggedPDFSuite:
             assert isinstance(md, str)
 
 
+class TestMetadata:
+    """Test document metadata extraction."""
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_metadata_returns_dict(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            meta = doc.metadata
+            assert isinstance(meta, dict)
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_metadata_has_title(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            meta = doc.metadata
+            assert "title" in meta
+            assert isinstance(meta["title"], str)
+            assert len(meta["title"]) > 0
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_metadata_has_author(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            meta = doc.metadata
+            assert "author" in meta
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_metadata_has_producer(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            meta = doc.metadata
+            assert "producer" in meta
+
+    def test_metadata_empty_for_simple_pdf(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            meta = doc.metadata
+            assert isinstance(meta, dict)
+
+    def test_metadata_after_close(self):
+        doc = zpdf.Document(TEST_PDF)
+        doc.close()
+        with pytest.raises(ValueError, match="closed"):
+            _ = doc.metadata
+
+
+class TestOutline:
+    """Test document outline / TOC extraction."""
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_outline_returns_list(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            outline = doc.outline
+            assert isinstance(outline, list)
+            assert len(outline) > 0
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_outline_item_structure(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            outline = doc.outline
+            item = outline[0]
+            assert "title" in item
+            assert "page" in item
+            assert "level" in item
+            assert isinstance(item["title"], str)
+            assert isinstance(item["level"], int)
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_outline_has_nested_levels(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            outline = doc.outline
+            levels = {item["level"] for item in outline}
+            assert 0 in levels
+            assert 1 in levels  # Acrobat reference has nested bookmarks
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_outline_titles_are_clean_utf8(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            outline = doc.outline
+            for item in outline[:10]:
+                # Should not have BOM replacement characters
+                assert "\ufffd" not in item["title"]
+
+    def test_outline_empty_for_simple_pdf(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            outline = doc.outline
+            assert isinstance(outline, list)
+
+    def test_outline_after_close(self):
+        doc = zpdf.Document(TEST_PDF)
+        doc.close()
+        with pytest.raises(ValueError, match="closed"):
+            _ = doc.outline
+
+
+class TestSearch:
+    """Test text search across pages."""
+
+    def test_search_returns_list(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            results = doc.search("the")
+            assert isinstance(results, list)
+
+    def test_search_result_structure(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            text = doc.extract_page(0)
+            # Find a word that exists
+            words = text.split()
+            if not words:
+                pytest.skip("No text on page 0")
+            query = words[0][:4]  # First 4 chars of first word
+            results = doc.search(query)
+            if results:
+                r = results[0]
+                assert "page" in r
+                assert "offset" in r
+                assert "context" in r
+                assert isinstance(r["page"], int)
+                assert isinstance(r["context"], str)
+
+    def test_search_no_matches(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            results = doc.search("zzz_nonexistent_string_zzz")
+            assert results == []
+
+    def test_search_case_insensitive(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            text = doc.extract_page(0).lower()
+            words = [w for w in text.split() if len(w) >= 3]
+            if not words:
+                pytest.skip("No text to search")
+            # Search with uppercase version
+            results = doc.search(words[0].upper())
+            assert len(results) >= 1
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_search_multi_page(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            results = doc.search("Adobe")
+            assert len(results) > 1
+            # Should span multiple pages
+            pages = {r["page"] for r in results}
+            assert len(pages) > 1
+
+    def test_search_context_contains_query(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            text = doc.extract_page(0)
+            words = [w for w in text.split() if len(w) >= 4]
+            if not words:
+                pytest.skip("No text to search")
+            results = doc.search(words[0])
+            if results:
+                assert words[0].lower() in results[0]["context"].lower()
+
+    def test_search_after_close(self):
+        doc = zpdf.Document(TEST_PDF)
+        doc.close()
+        with pytest.raises(ValueError, match="closed"):
+            doc.search("test")
+
+
+class TestPageLabels:
+    """Test page label extraction."""
+
+    def test_page_label_returns_none_for_simple_pdf(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            label = doc.get_page_label(0)
+            # Simple PDFs may not have labels
+            assert label is None or isinstance(label, str)
+
+    @pytest.mark.skipif(not ACROBAT_PDF.exists(), reason="Acrobat PDF not available")
+    def test_page_label_acrobat(self):
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            label = doc.get_page_label(0)
+            # May or may not have labels
+            if label is not None:
+                assert isinstance(label, str)
+
+    def test_page_label_after_close(self):
+        doc = zpdf.Document(TEST_PDF)
+        doc.close()
+        with pytest.raises(ValueError, match="closed"):
+            doc.get_page_label(0)
+
+
+class TestLinks:
+    """Test link/annotation extraction."""
+
+    def test_links_returns_list(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            links = doc.get_links(0)
+            assert isinstance(links, list)
+
+    def test_link_structure(self):
+        """If links exist, verify structure."""
+        # Try Acrobat PDF which likely has links
+        if not ACROBAT_PDF.exists():
+            pytest.skip("Acrobat PDF not available")
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            for i in range(min(20, doc.page_count)):
+                links = doc.get_links(i)
+                if links:
+                    link = links[0]
+                    assert "rect" in link
+                    assert "uri" in link
+                    assert "dest_page" in link
+                    assert isinstance(link["rect"], list)
+                    assert len(link["rect"]) == 4
+                    return
+            pytest.skip("No links found in first 20 pages")
+
+    def test_links_empty_page(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            links = doc.get_links(0)
+            assert isinstance(links, list)
+
+    def test_links_invalid_page(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            # Out of range pages should return empty list or raise
+            try:
+                links = doc.get_links(9999)
+                assert links == []
+            except (zpdf.PageNotFoundError, zpdf.ExtractionError):
+                pass
+
+    def test_links_after_close(self):
+        doc = zpdf.Document(TEST_PDF)
+        doc.close()
+        with pytest.raises(ValueError, match="closed"):
+            doc.get_links(0)
+
+
+class TestImages:
+    """Test image detection on pages."""
+
+    def test_images_returns_list(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            images = doc.get_images(0)
+            assert isinstance(images, list)
+
+    def test_image_structure(self):
+        """If images exist, verify structure."""
+        if not ACROBAT_PDF.exists():
+            pytest.skip("Acrobat PDF not available")
+        with zpdf.Document(ACROBAT_PDF) as doc:
+            for i in range(min(30, doc.page_count)):
+                images = doc.get_images(i)
+                if images:
+                    img = images[0]
+                    assert "rect" in img
+                    assert "width" in img
+                    assert "height" in img
+                    assert isinstance(img["rect"], list)
+                    assert len(img["rect"]) == 4
+                    assert isinstance(img["width"], int)
+                    assert isinstance(img["height"], int)
+                    return
+            pytest.skip("No images found in first 30 pages")
+
+    def test_images_invalid_page(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            try:
+                images = doc.get_images(9999)
+                assert images == []
+            except (zpdf.PageNotFoundError, zpdf.ExtractionError):
+                pass
+
+    def test_images_after_close(self):
+        doc = zpdf.Document(TEST_PDF)
+        doc.close()
+        with pytest.raises(ValueError, match="closed"):
+            doc.get_images(0)
+
+
+class TestFormFields:
+    """Test form field extraction."""
+
+    def test_form_fields_returns_list(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            fields = doc.form_fields
+            assert isinstance(fields, list)
+
+    def test_form_fields_empty_for_simple_pdf(self):
+        with zpdf.Document(TEST_PDF) as doc:
+            fields = doc.form_fields
+            # Test PDF probably doesn't have form fields
+            assert isinstance(fields, list)
+
+    def test_form_fields_after_close(self):
+        doc = zpdf.Document(TEST_PDF)
+        doc.close()
+        with pytest.raises(ValueError, match="closed"):
+            _ = doc.form_fields
+
+
 class TestMalformedPDFRobustness:
     """Ensure malformed PDFs do not crash — they should either parse or raise a known error."""
 

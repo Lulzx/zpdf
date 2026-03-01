@@ -956,3 +956,384 @@ test "generate page label PDF" {
     defer std.testing.allocator.free(pdf_data);
     try std.testing.expect(std.mem.indexOf(u8, pdf_data, "/PageLabels") != null);
 }
+
+/// Generate a PDF with a nested outline (multiple levels, siblings, GoTo actions)
+pub fn generateNestedOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    // Object 1: Catalog with Outlines
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R >>\nendobj\n");
+
+    // Object 2: Pages (2 pages)
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 10 0 R] /Count 2 >>\nendobj\n");
+
+    // Page 1
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    const c1 = "BT\n/F1 12 Tf\n100 700 Td\n(Page One) Tj\nET\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ c1.len, c1 });
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    // Object 6: Outlines root
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n<< /Type /Outlines /First 7 0 R /Last 8 0 R /Count 2 >>\nendobj\n");
+
+    // Object 7: "Part I" — top level, has child 9, next sibling 8, dest = page 1
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /Title (Part I) /Parent 6 0 R /Next 8 0 R ");
+    try writer.writeAll("/First 9 0 R /Last 9 0 R /Count 1 /Dest [3 0 R /Fit] >>\nendobj\n");
+
+    // Object 8: "Part II" — top level, via /A GoTo action, dest = page 2
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n<< /Title (Part II) /Parent 6 0 R ");
+    try writer.writeAll("/A << /S /GoTo /D [10 0 R /Fit] >> >>\nendobj\n");
+
+    // Object 9: "Section 1.1" — child of Part I, level 1, dest = page 1
+    const obj9_offset = pdf.items.len;
+    try writer.writeAll("9 0 obj\n<< /Title (Section 1.1) /Parent 7 0 R /Dest [3 0 R /Fit] >>\nendobj\n");
+
+    // Page 2
+    const obj10_offset = pdf.items.len;
+    try writer.writeAll("10 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 11 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    const c2 = "BT\n/F1 12 Tf\n100 700 Td\n(Page Two) Tj\nET\n";
+    const obj11_offset = pdf.items.len;
+    try writer.print("11 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ c2.len, c2 });
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 12\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj10_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj11_offset});
+
+    try writer.writeAll("trailer\n<< /Size 12 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF with multiple link annotations: URI, GoTo internal, and a non-link annotation
+pub fn generateMultiLinkPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Page with 3 annotations: 2 links + 1 highlight (should be ignored)
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> ");
+    try writer.writeAll("/Annots [6 0 R 7 0 R 8 0 R] >>\nendobj\n");
+
+    const content = "BT\n/F1 12 Tf\n100 700 Td\n(Links page) Tj\nET\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    // Object 6: URI link
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 10 100 30] ");
+    try writer.writeAll("/A << /S /URI /URI (https://example.org) >> >>\nendobj\n");
+
+    // Object 7: GoTo internal link to page 1 (obj 3)
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 40 100 60] ");
+    try writer.writeAll("/A << /S /GoTo /D [3 0 R /Fit] >> >>\nendobj\n");
+
+    // Object 8: Highlight annotation (NOT a link, should be skipped)
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n<< /Type /Annot /Subtype /Highlight /Rect [10 70 100 90] >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 9\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+
+    try writer.writeAll("trailer\n<< /Size 9 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF with all form field types: text, button, choice, signature
+pub fn generateAllFormFieldsPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R ");
+    try writer.writeAll("/AcroForm << /Fields [6 0 R 7 0 R 8 0 R 9 0 R] >> >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    const content = "BT\n/F1 12 Tf\n100 700 Td\n(All Fields) Tj\nET\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    // Text field with value
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n<< /FT /Tx /T (email) /V (user@example.com) ");
+    try writer.writeAll("/Rect [100 600 300 620] >>\nendobj\n");
+
+    // Button field (no value)
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /FT /Btn /T (ok_button) >>\nendobj\n");
+
+    // Choice field with value
+    const obj8_offset = pdf.items.len;
+    try writer.writeAll("8 0 obj\n<< /FT /Ch /T (country) /V (USA) ");
+    try writer.writeAll("/Rect [100 500 300 520] >>\nendobj\n");
+
+    // Signature field (no value)
+    const obj9_offset = pdf.items.len;
+    try writer.writeAll("9 0 obj\n<< /FT /Sig /T (signature) >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 10\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj8_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj9_offset});
+
+    try writer.writeAll("trailer\n<< /Size 10 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF with page labels: uppercase roman, alpha, prefix, custom start
+pub fn generateExtendedPageLabelPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    // Pages 0-1: uppercase roman (I, II)
+    // Page 2: alpha lowercase starting at 1 (a)
+    // Pages 3+: decimal with prefix "App-" starting at 1 (App-1)
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R ");
+    try writer.writeAll("/PageLabels << /Nums [0 << /S /R >> 2 << /S /a >> 3 << /S /D /P (App-) /St 1 >>] >> >>\nendobj\n");
+
+    // 5 pages
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R 8 0 R 10 0 R 12 0 R] /Count 5 >>\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    // Generate 5 pages (objects 3,4, 6,7, 8,9, 10,11, 12,13)
+    const page_texts = [_][]const u8{ "Page I", "Page II", "Page a", "App Page 1", "App Page 2" };
+    var page_offsets: [10]u64 = undefined; // pairs of (page_obj, content_obj)
+    for (0..5) |pg| {
+        const page_obj_num = 3 + pg * 2;
+        const content_obj_num = page_obj_num + 1;
+        if (page_obj_num == 5) {
+            // Skip obj 5 (font) — already written. Adjust numbering.
+            // Actually our numbering is 3,4, 6,7, 8,9, 10,11, 12,13 — no collision with 5.
+        }
+
+        page_offsets[pg * 2] = pdf.items.len;
+        try writer.print("{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ", .{page_obj_num});
+        try writer.print("/Contents {} 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n", .{content_obj_num});
+
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(allocator);
+        var cw = content.writer(allocator);
+        try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n");
+        try cw.print("({s}) Tj\n", .{page_texts[pg]});
+        try cw.writeAll("ET\n");
+
+        page_offsets[pg * 2 + 1] = pdf.items.len;
+        try writer.print("{} 0 obj\n<< /Length {} >>\nstream\n", .{ content_obj_num, content.items.len });
+        try writer.writeAll(content.items);
+        try writer.writeAll("\nendstream\nendobj\n");
+    }
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 14\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[0]}); // obj 3
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[1]}); // obj 4
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset}); // obj 5
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[2]}); // obj 6
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[3]}); // obj 7
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[4]}); // obj 8
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[5]}); // obj 9
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[6]}); // obj 10
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[7]}); // obj 11
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[8]}); // obj 12
+    try writer.print("{d:0>10} 00000 n \n", .{page_offsets[9]}); // obj 13
+
+    try writer.writeAll("trailer\n<< /Size 14 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF with an XObject image on the page
+pub fn generateImagePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Page with XObject resource
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 7 0 R >> >> >>\nendobj\n");
+
+    // Content stream: text + cm (scale) + Do image
+    const content = "BT\n/F1 12 Tf\n100 700 Td\n(Image below) Tj\nET\n200 0 0 150 100 500 cm\n/Im1 Do\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    // Object 6: (unused)
+
+    // Object 7: Image XObject (1x1 grayscale pixel)
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /Type /XObject /Subtype /Image /Width 640 /Height 480 ");
+    try writer.writeAll("/ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\n");
+    try writer.writeAll("stream\n\xFF\nendstream\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 8\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    // obj 6 unused — write dummy
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset}); // placeholder
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+
+    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF with UTF-16BE encoded metadata and outline title
+pub fn generateUtf16BePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    // Catalog with Outlines
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    const content = "BT\n/F1 12 Tf\n100 700 Td\n(UTF16 test) Tj\nET\n";
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    // Object 6: Outlines root
+    const obj6_offset = pdf.items.len;
+    try writer.writeAll("6 0 obj\n<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>\nendobj\n");
+
+    // Object 7: Outline item with UTF-16BE title "Café" = FE FF 0043 0061 0066 00E9
+    const obj7_offset = pdf.items.len;
+    try writer.writeAll("7 0 obj\n<< /Title <FEFF00430061006600E9> /Parent 6 0 R /Dest [3 0 R /Fit] >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 8\n");
+    try writer.writeAll("0000000000 65535 f \n");
+    try writer.print("{d:0>10} 00000 n \n", .{obj1_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj2_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj3_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj4_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj5_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj6_offset});
+    try writer.print("{d:0>10} 00000 n \n", .{obj7_offset});
+
+    try writer.writeAll("trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
