@@ -271,6 +271,208 @@ class Document:
         finally:
             lib.zpdf_free_buffer(buf_ptr, out_len[0])
 
+    # =========================================================================
+    # Document Metadata
+    # =========================================================================
+
+    @property
+    def metadata(self) -> dict:
+        """Document metadata (title, author, subject, keywords, creator, producer, creation_date, mod_date)."""
+        self._check_open()
+        meta = ffi.new("CMetadata*")
+        result = lib.zpdf_get_metadata(self._handle, meta)
+        if result != 0:
+            return {}
+
+        def _get_str(ptr, length):
+            if length == 0:
+                return None
+            return ffi.buffer(ptr, length)[:].decode("utf-8", errors="replace")
+
+        out = {}
+        for field in ("title", "author", "subject", "keywords", "creator", "producer", "creation_date", "mod_date"):
+            val = _get_str(getattr(meta, field), getattr(meta, f"{field}_len"))
+            if val is not None:
+                out[field] = val
+        return out
+
+    # =========================================================================
+    # Document Outline / TOC
+    # =========================================================================
+
+    @property
+    def outline(self) -> list[dict]:
+        """Document outline/TOC. Each entry: {"title": str, "page": int or None, "level": int}."""
+        self._check_open()
+        out_ptr = ffi.new("COutlineItem**")
+        count = ffi.new("size_t*")
+
+        result = lib.zpdf_get_outline(self._handle, out_ptr, count)
+        if result != 0 or out_ptr[0] == ffi.NULL:
+            return []
+
+        try:
+            items = []
+            for i in range(count[0]):
+                item = out_ptr[0][i]
+                title = ffi.buffer(item.title, item.title_len)[:].decode("utf-8", errors="replace")
+                page = item.page if item.page >= 0 else None
+                items.append({"title": title, "page": page, "level": item.level})
+            return items
+        finally:
+            lib.zpdf_free_outline(out_ptr[0], count[0])
+
+    # =========================================================================
+    # Text Search
+    # =========================================================================
+
+    def search(self, query: str) -> list[dict]:
+        """Search for text across all pages.
+
+        Returns list of matches, each with: {"page": int, "offset": int, "context": str}.
+        Search is case-insensitive.
+        """
+        self._check_open()
+        query_bytes = query.encode("utf-8")
+        out_ptr = ffi.new("CSearchResult**")
+        count = ffi.new("size_t*")
+
+        result = lib.zpdf_search(self._handle, query_bytes, len(query_bytes), out_ptr, count)
+        if result != 0 or out_ptr[0] == ffi.NULL:
+            return []
+
+        try:
+            results = []
+            for i in range(count[0]):
+                r = out_ptr[0][i]
+                context = ffi.buffer(r.context, r.context_len)[:].decode("utf-8", errors="replace")
+                results.append({"page": r.page, "offset": r.offset, "context": context})
+            return results
+        finally:
+            lib.zpdf_free_search_results(out_ptr[0], count[0])
+
+    # =========================================================================
+    # Page Labels
+    # =========================================================================
+
+    def get_page_label(self, page_num: int) -> Optional[str]:
+        """Get the display label for a page (e.g., 'i', 'ii', '1', '2', 'A-1')."""
+        self._check_open()
+        out_len = ffi.new("size_t*")
+        buf_ptr = lib.zpdf_get_page_label(self._handle, page_num, out_len)
+        if buf_ptr == ffi.NULL:
+            return None
+        try:
+            return ffi.buffer(buf_ptr, out_len[0])[:].decode("utf-8", errors="replace")
+        finally:
+            lib.zpdf_free_buffer(buf_ptr, out_len[0])
+
+    # =========================================================================
+    # Links
+    # =========================================================================
+
+    def get_links(self, page_num: int) -> list[dict]:
+        """Extract link annotations from a page.
+
+        Returns list of links, each with: {"rect": [x0,y0,x1,y1], "uri": str or None, "dest_page": int or None}.
+        """
+        self._check_open()
+        out_ptr = ffi.new("CLink**")
+        count = ffi.new("size_t*")
+
+        result = lib.zpdf_get_page_links(self._handle, page_num, out_ptr, count)
+        if result != 0 or out_ptr[0] == ffi.NULL:
+            return []
+
+        try:
+            links = []
+            for i in range(count[0]):
+                link = out_ptr[0][i]
+                uri = None
+                if link.uri_len > 0:
+                    uri = ffi.buffer(link.uri, link.uri_len)[:].decode("utf-8", errors="replace")
+                dest_page = link.dest_page if link.dest_page >= 0 else None
+                links.append({
+                    "rect": [link.x0, link.y0, link.x1, link.y1],
+                    "uri": uri,
+                    "dest_page": dest_page,
+                })
+            return links
+        finally:
+            lib.zpdf_free_links(out_ptr[0], count[0])
+
+    # =========================================================================
+    # Images
+    # =========================================================================
+
+    def get_images(self, page_num: int) -> list[dict]:
+        """Detect images on a page.
+
+        Returns list of images, each with: {"rect": [x0,y0,x1,y1], "width": int, "height": int}.
+        """
+        self._check_open()
+        out_ptr = ffi.new("CImageInfo**")
+        count = ffi.new("size_t*")
+
+        result = lib.zpdf_get_page_images(self._handle, page_num, out_ptr, count)
+        if result != 0 or out_ptr[0] == ffi.NULL:
+            return []
+
+        try:
+            images = []
+            for i in range(count[0]):
+                img = out_ptr[0][i]
+                images.append({
+                    "rect": [img.x0, img.y0, img.x1, img.y1],
+                    "width": img.width,
+                    "height": img.height,
+                })
+            return images
+        finally:
+            lib.zpdf_free_images(out_ptr[0], count[0])
+
+    # =========================================================================
+    # Form Fields
+    # =========================================================================
+
+    @property
+    def form_fields(self) -> list[dict]:
+        """Extract form fields from the document.
+
+        Returns list of fields, each with:
+        {"name": str, "value": str or None, "type": str, "rect": [x0,y0,x1,y1] or None}.
+        """
+        self._check_open()
+        out_ptr = ffi.new("CFormField**")
+        count = ffi.new("size_t*")
+
+        result = lib.zpdf_get_form_fields(self._handle, out_ptr, count)
+        if result != 0 or out_ptr[0] == ffi.NULL:
+            return []
+
+        field_types = {0: "text", 1: "button", 2: "choice", 3: "signature", 4: "unknown"}
+
+        try:
+            fields = []
+            for i in range(count[0]):
+                f = out_ptr[0][i]
+                name = ffi.buffer(f.name, f.name_len)[:].decode("utf-8", errors="replace")
+                value = None
+                if f.value_len > 0:
+                    value = ffi.buffer(f.value, f.value_len)[:].decode("utf-8", errors="replace")
+                rect = None
+                if f.has_rect:
+                    rect = [f.x0, f.y0, f.x1, f.y1]
+                fields.append({
+                    "name": name,
+                    "value": value,
+                    "type": field_types.get(f.field_type, "unknown"),
+                    "rect": rect,
+                })
+            return fields
+        finally:
+            lib.zpdf_free_form_fields(out_ptr[0], count[0])
+
     def __iter__(self) -> Iterator[str]:
         for i in range(self.page_count):
             yield self.extract_page(i)

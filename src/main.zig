@@ -28,6 +28,8 @@ pub fn main() !void {
         try runExtract(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "info")) {
         try runInfo(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "search")) {
+        try runSearch(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "bench")) {
         try runBench(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "--help")) {
@@ -50,7 +52,8 @@ fn printUsage() !void {
         \\
         \\Commands:
         \\  extract     Extract text from PDF (like mutool draw -F txt)
-        \\  info        Show PDF structure information
+        \\  info        Show PDF structure information (metadata, outline, etc.)
+        \\  search      Search for text across all pages
         \\  bench       Benchmark extraction performance
         \\  help        Show this help
         \\
@@ -72,6 +75,7 @@ fn printUsage() !void {
         \\  zpdf extract --markdown doc.pdf        # Export as Markdown
         \\  zpdf extract -f md -o out.md doc.pdf   # Markdown to file
         \\  zpdf extract --reading-order doc.pdf   # Visual reading order
+        \\  zpdf search "revenue" document.pdf      # Search across all pages
         \\  zpdf bench document.pdf                # Benchmark vs mutool
         \\
     );
@@ -247,18 +251,81 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
 fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFormat, extraction_mode: ExtractionMode, allocator: std.mem.Allocator, writer: anytype) !void {
     if (output_format == .json) {
-        try writer.writeAll("{\n  \"pages\": [\n");
+        try writer.writeAll("{\n");
+
+        // Metadata
+        const meta = doc.metadata();
+        try writer.writeAll("  \"metadata\": {");
+        var meta_first = true;
+        inline for (.{
+            .{ "title", meta.title },
+            .{ "author", meta.author },
+            .{ "subject", meta.subject },
+            .{ "keywords", meta.keywords },
+            .{ "creator", meta.creator },
+            .{ "producer", meta.producer },
+            .{ "creation_date", meta.creation_date },
+            .{ "mod_date", meta.mod_date },
+        }) |pair| {
+            if (pair[1]) |val| {
+                if (!meta_first) try writer.writeAll(",");
+                try writer.print("\n    \"{s}\": \"", .{pair[0]});
+                try writeJsonEscapedString(writer, val);
+                try writer.writeAll("\"");
+                meta_first = false;
+            }
+        }
+        if (!meta_first) try writer.writeAll("\n  ");
+        try writer.writeAll("},\n");
+
+        // Page count
+        try writer.print("  \"page_count\": {},\n", .{doc.pages.items.len});
+
+        // Outline
+        const outline_items = doc.getOutline(allocator) catch &.{};
+        defer if (outline_items.len > 0) {
+            for (outline_items) |item| {
+                allocator.free(@constCast(item.title));
+            }
+            allocator.free(outline_items);
+        };
+
+        try writer.writeAll("  \"outline\": [");
+        for (outline_items, 0..) |item, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("\n    {\"title\": \"");
+            try writeJsonEscapedString(writer, item.title);
+            try writer.print("\", \"page\": {}, \"level\": {}}}", .{
+                if (item.page) |p| @as(i32, @intCast(p)) else @as(i32, -1),
+                item.level,
+            });
+        }
+        if (outline_items.len > 0) try writer.writeAll("\n  ");
+        try writer.writeAll("],\n");
+
+        // Pages
+        try writer.writeAll("  \"pages\": [\n");
     }
 
     for (pages, 0..) |page_num, idx| {
         if (output_format == .json) {
             if (idx > 0) try writer.writeAll(",\n");
-            try writer.print("    {{\"page\": {}, \"text\": \"", .{page_num + 1});
+            try writer.writeAll("    {\n");
+            try writer.print("      \"page\": {}", .{page_num + 1});
+
+            // Page label
+            if (doc.getPageLabel(allocator, page_num)) |label| {
+                defer allocator.free(label);
+                try writer.writeAll(",\n      \"label\": \"");
+                try writeJsonEscapedString(writer, label);
+                try writer.writeAll("\"");
+            }
+
+            try writer.writeAll(",\n      \"text\": \"");
         }
 
         switch (output_format) {
             .markdown => {
-                // Markdown extraction
                 const text = doc.extractMarkdown(page_num, allocator) catch |err| {
                     std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
                     continue;
@@ -271,12 +338,10 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
             },
             .json, .text => {
                 const text = switch (extraction_mode) {
-                    // Structure tree reading order (falls back to geometric order)
                     .normal => doc.extractTextStructured(page_num, allocator) catch |err| {
                         std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
                         continue;
                     },
-                    // Visual reading order extraction
                     .visual => extractPageReadingOrder(doc, page_num, allocator) catch |err| {
                         std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
                         continue;
@@ -286,10 +351,50 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
 
                 if (output_format == .json) {
                     try writeJsonEscapedString(writer, text);
-                    try writer.writeAll("\"}");
+                    try writer.writeAll("\"");
+
+                    // Links for this page
+                    try writer.writeAll(",\n      \"links\": [");
+                    if (doc.getPageLinks(page_num, allocator)) |links| {
+                        defer zpdf.Document.freeLinks(allocator, links);
+                        for (links, 0..) |link, li| {
+                            if (li > 0) try writer.writeAll(",");
+                            try writer.writeAll("\n        {");
+                            if (link.uri) |uri| {
+                                try writer.writeAll("\"uri\": \"");
+                                try writeJsonEscapedString(writer, uri);
+                                try writer.writeAll("\", ");
+                            }
+                            if (link.dest_page) |dp| {
+                                try writer.print("\"dest_page\": {}, ", .{dp});
+                            }
+                            try writer.print("\"rect\": [{d:.1}, {d:.1}, {d:.1}, {d:.1}]}}", .{
+                                link.rect[0], link.rect[1], link.rect[2], link.rect[3],
+                            });
+                        }
+                        if (links.len > 0) try writer.writeAll("\n      ");
+                    } else |_| {}
+                    try writer.writeAll("]");
+
+                    // Images for this page
+                    try writer.writeAll(",\n      \"images\": [");
+                    if (doc.getPageImages(page_num, allocator)) |images| {
+                        defer zpdf.Document.freeImages(allocator, images);
+                        for (images, 0..) |img, ii| {
+                            if (ii > 0) try writer.writeAll(",");
+                            try writer.print("\n        {{\"rect\": [{d:.1}, {d:.1}, {d:.1}, {d:.1}], \"width\": {}, \"height\": {}}}", .{
+                                img.rect[0], img.rect[1], img.rect[2], img.rect[3],
+                                img.width, img.height,
+                            });
+                        }
+                        if (images.len > 0) try writer.writeAll("\n      ");
+                    } else |_| {}
+                    try writer.writeAll("]");
+
+                    try writer.writeAll("\n    }");
                 } else if (idx + 1 < pages.len) {
                     try writer.writeAll(text);
-                    try writer.writeByte('\x0c'); // Form feed between pages
+                    try writer.writeByte('\x0c');
                 } else {
                     try writer.writeAll(text);
                 }
@@ -472,6 +577,19 @@ fn runInfo(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (doc.isEncrypted()) "yes" else "no",
     });
 
+    // Print metadata
+    const meta = doc.metadata();
+    var has_meta = false;
+    inline for (.{ .{ "Title", meta.title }, .{ "Author", meta.author }, .{ "Subject", meta.subject }, .{ "Keywords", meta.keywords }, .{ "Creator", meta.creator }, .{ "Producer", meta.producer }, .{ "Created", meta.creation_date }, .{ "Modified", meta.mod_date } }) |pair| {
+        if (pair[1]) |val| {
+            if (!has_meta) {
+                try stdout.writeAll("\nMetadata:\n");
+                has_meta = true;
+            }
+            try stdout.print("  {s}: {s}\n", .{ pair[0], val });
+        }
+    }
+
     // Print page sizes
     try stdout.writeAll("\nPage sizes:\n");
     for (doc.pages.items, 0..) |page, i| {
@@ -488,6 +606,92 @@ fn runInfo(allocator: std.mem.Allocator, args: []const []const u8) !void {
             }
             break;
         }
+    }
+
+    // Print outline
+    const outline_items = doc.getOutline(allocator) catch &.{};
+    defer if (outline_items.len > 0) {
+        for (outline_items) |item| {
+            allocator.free(@constCast(item.title));
+        }
+        allocator.free(outline_items);
+    };
+
+    if (outline_items.len > 0) {
+        try stdout.writeAll("\nOutline:\n");
+        for (outline_items, 0..) |item, i| {
+            // Indent by level
+            var indent: u32 = 0;
+            while (indent < item.level) : (indent += 1) {
+                try stdout.writeAll("  ");
+            }
+            try stdout.print("  {s}", .{item.title});
+            if (item.page) |p| {
+                try stdout.print(" (page {})", .{p + 1});
+            }
+            try stdout.writeByte('\n');
+            if (i >= 49) {
+                if (outline_items.len > 50) {
+                    try stdout.print("  ... and {} more entries\n", .{outline_items.len - 50});
+                }
+                break;
+            }
+        }
+    }
+
+    // Print form fields count
+    if (doc.getFormFields(allocator)) |fields| {
+        defer zpdf.Document.freeFormFields(allocator, fields);
+        if (fields.len > 0) {
+            try stdout.print("\nForm fields: {}\n", .{fields.len});
+        }
+    } else |_| {}
+}
+
+fn runSearch(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 2) {
+        std.debug.print("Usage: zpdf search <query> <input.pdf>\n", .{});
+        return;
+    }
+
+    const query = args[0];
+    const path = args[1];
+
+    const doc = zpdf.Document.openWithConfig(allocator, path, zpdf.ErrorConfig.default()) catch |err| {
+        std.debug.print("Error opening {s}: {}\n", .{ path, err });
+        return;
+    };
+    defer doc.close();
+
+    const results = doc.search(allocator, query) catch |err| {
+        std.debug.print("Error searching: {}\n", .{err});
+        return;
+    };
+    defer zpdf.Document.freeSearchResults(allocator, results);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_bw = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_bw.interface;
+    defer stdout.flush() catch {};
+
+    if (results.len == 0) {
+        try stdout.print("No matches found for \"{s}\" in {s}\n", .{ query, path });
+        return;
+    }
+
+    try stdout.print("Found {} match{s} for \"{s}\" in {s}:\n\n", .{
+        results.len,
+        if (results.len == 1) "" else "es",
+        query,
+        path,
+    });
+
+    for (results) |r| {
+        try stdout.print("  Page {}, offset {}: \"...{s}...\"\n", .{
+            r.page + 1,
+            r.offset,
+            r.context,
+        });
     }
 }
 

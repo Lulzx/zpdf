@@ -27,6 +27,7 @@ pub const simd = @import("simd.zig");
 pub const layout = @import("layout.zig");
 pub const structtree = @import("structtree.zig");
 pub const markdown = @import("markdown.zig");
+pub const outline = @import("outline.zig");
 
 // Re-exports
 pub const Object = parser.Object;
@@ -957,7 +958,916 @@ pub const Document = struct {
         height: f64,
         rotation: i32,
     };
+
+    // =========================================================================
+    // Feature 1: Document Metadata (/Info dict)
+    // =========================================================================
+
+    pub const DocumentMetadata = struct {
+        title: ?[]const u8 = null,
+        author: ?[]const u8 = null,
+        subject: ?[]const u8 = null,
+        keywords: ?[]const u8 = null,
+        creator: ?[]const u8 = null,
+        producer: ?[]const u8 = null,
+        creation_date: ?[]const u8 = null,
+        mod_date: ?[]const u8 = null,
+    };
+
+    /// Extract document metadata from the /Info dictionary
+    pub fn metadata(self: *Document) DocumentMetadata {
+        const info_ref = self.xref_table.trailer.get("Info") orelse return .{};
+        const dict = switch (info_ref) {
+            .dict => |d| d,
+            .reference => |r| blk: {
+                const obj = self.resolve(r) catch return .{};
+                break :blk switch (obj) {
+                    .dict => |d| d,
+                    else => return .{},
+                };
+            },
+            else => return .{},
+        };
+        return .{
+            .title = dict.getString("Title"),
+            .author = dict.getString("Author"),
+            .subject = dict.getString("Subject"),
+            .keywords = dict.getString("Keywords"),
+            .creator = dict.getString("Creator"),
+            .producer = dict.getString("Producer"),
+            .creation_date = dict.getString("CreationDate"),
+            .mod_date = dict.getString("ModDate"),
+        };
+    }
+
+    // =========================================================================
+    // Feature 2: Document Outline / TOC (/Outlines)
+    // =========================================================================
+
+    pub const OutlineItem = outline.OutlineItem;
+
+    /// Extract the document outline (table of contents / bookmarks)
+    pub fn getOutline(self: *Document, allocator: std.mem.Allocator) ![]OutlineItem {
+        return outline.parseOutline(
+            allocator,
+            self.parsing_arena.allocator(),
+            self.data,
+            &self.xref_table,
+            &self.object_cache,
+            self.pages.items,
+        );
+    }
+
+    // =========================================================================
+    // Feature 3: Page Labels (/PageLabels)
+    // =========================================================================
+
+    /// Get the display label for a page (e.g., "i", "ii", "1", "2", "A-1")
+    /// Caller must free the returned slice.
+    pub fn getPageLabel(self: *Document, allocator: std.mem.Allocator, page_idx: usize) ?[]u8 {
+        const arena = self.parsing_arena.allocator();
+
+        // Get catalog
+        const root_ref = switch (self.xref_table.trailer.get("Root") orelse return null) {
+            .reference => |r| r,
+            else => return null,
+        };
+        const catalog = pagetree.resolveRef(arena, self.data, &self.xref_table, root_ref, &self.object_cache) catch return null;
+        const catalog_dict = switch (catalog) {
+            .dict => |d| d,
+            else => return null,
+        };
+
+        // Get /PageLabels number tree
+        const pl_obj = catalog_dict.get("PageLabels") orelse return null;
+        const pl_dict = switch (pl_obj) {
+            .dict => |d| d,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch return null;
+                break :blk switch (obj) {
+                    .dict => |d| d,
+                    else => return null,
+                };
+            },
+            else => return null,
+        };
+
+        // Get /Nums array
+        const nums_arr = blk: {
+            const nums_obj = pl_dict.get("Nums") orelse return null;
+            break :blk switch (nums_obj) {
+                .array => |a| a,
+                .reference => |r| inner: {
+                    const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch return null;
+                    break :inner switch (obj) {
+                        .array => |a| a,
+                        else => return null,
+                    };
+                },
+                else => return null,
+            };
+        };
+
+        // Find the applicable range entry for page_idx
+        // /Nums is [key1 value1 key2 value2 ...] sorted by key
+        var best_start: ?usize = null;
+        var best_label_dict: ?Object.Dict = null;
+
+        var i: usize = 0;
+        while (i + 1 < nums_arr.len) : (i += 2) {
+            const start = switch (nums_arr[i]) {
+                .integer => |n| @as(usize, @intCast(n)),
+                else => continue,
+            };
+            if (start > page_idx) break;
+
+            const label_obj = switch (nums_arr[i + 1]) {
+                .dict => |d| d,
+                .reference => |r| inner: {
+                    const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch continue;
+                    break :inner switch (obj) {
+                        .dict => |d| d,
+                        else => continue,
+                    };
+                },
+                else => continue,
+            };
+            best_start = start;
+            best_label_dict = label_obj;
+        }
+
+        const range_start = best_start orelse return null;
+        const label_dict = best_label_dict orelse return null;
+
+        // /St (start value, default 1), /S (style), /P (prefix)
+        const st: usize = if (label_dict.getInt("St")) |v| @intCast(v) else 1;
+        const page_number = st + (page_idx - range_start);
+        const style = label_dict.getName("S");
+        const prefix = label_dict.getString("P");
+
+        // Format the label
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        if (prefix) |p| {
+            buf.appendSlice(allocator, p) catch return null;
+        }
+
+        if (style) |s| {
+            if (s.len > 0) switch (s[0]) {
+                'D' => {
+                    // Decimal
+                    buf.writer(allocator).print("{}", .{page_number}) catch return null;
+                },
+                'r' => {
+                    // Lowercase roman
+                    formatRoman(&buf, allocator, page_number, false) catch return null;
+                },
+                'R' => {
+                    // Uppercase roman
+                    formatRoman(&buf, allocator, page_number, true) catch return null;
+                },
+                'a' => {
+                    // Lowercase alpha
+                    formatAlpha(&buf, allocator, page_number, false) catch return null;
+                },
+                'A' => {
+                    // Uppercase alpha
+                    formatAlpha(&buf, allocator, page_number, true) catch return null;
+                },
+                else => {
+                    buf.writer(allocator).print("{}", .{page_number}) catch return null;
+                },
+            };
+        }
+
+        if (buf.items.len == 0) {
+            // No style, just return prefix or page number
+            if (prefix == null) {
+                buf.writer(allocator).print("{}", .{page_idx + 1}) catch return null;
+            }
+        }
+
+        return buf.toOwnedSlice(allocator) catch null;
+    }
+
+    fn formatRoman(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, upper: bool) !void {
+        if (number == 0 or number > 3999) {
+            try buf.writer(allocator).print("{}", .{number});
+            return;
+        }
+        const values = [_]struct { v: u16, s_upper: []const u8, s_lower: []const u8 }{
+            .{ .v = 1000, .s_upper = "M", .s_lower = "m" },
+            .{ .v = 900, .s_upper = "CM", .s_lower = "cm" },
+            .{ .v = 500, .s_upper = "D", .s_lower = "d" },
+            .{ .v = 400, .s_upper = "CD", .s_lower = "cd" },
+            .{ .v = 100, .s_upper = "C", .s_lower = "c" },
+            .{ .v = 90, .s_upper = "XC", .s_lower = "xc" },
+            .{ .v = 50, .s_upper = "L", .s_lower = "l" },
+            .{ .v = 40, .s_upper = "XL", .s_lower = "xl" },
+            .{ .v = 10, .s_upper = "X", .s_lower = "x" },
+            .{ .v = 9, .s_upper = "IX", .s_lower = "ix" },
+            .{ .v = 5, .s_upper = "V", .s_lower = "v" },
+            .{ .v = 4, .s_upper = "IV", .s_lower = "iv" },
+            .{ .v = 1, .s_upper = "I", .s_lower = "i" },
+        };
+        var n = number;
+        for (values) |entry| {
+            while (n >= entry.v) {
+                try buf.appendSlice(allocator, if (upper) entry.s_upper else entry.s_lower);
+                n -= entry.v;
+            }
+        }
+    }
+
+    fn formatAlpha(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, upper: bool) !void {
+        if (number == 0) {
+            try buf.writer(allocator).print("{}", .{number});
+            return;
+        }
+        // a=1, b=2, ..., z=26, aa=27, ab=28, ...
+        var n = number - 1;
+        var chars: [8]u8 = undefined;
+        var len: usize = 0;
+        while (true) {
+            const c: u8 = @intCast(n % 26);
+            chars[len] = if (upper) 'A' + c else 'a' + c;
+            len += 1;
+            if (n < 26) break;
+            n = n / 26 - 1;
+        }
+        // Reverse
+        var j: usize = 0;
+        while (j < len / 2) : (j += 1) {
+            const tmp = chars[j];
+            chars[j] = chars[len - 1 - j];
+            chars[len - 1 - j] = tmp;
+        }
+        try buf.appendSlice(allocator, chars[0..len]);
+    }
+
+    // =========================================================================
+    // Feature 4: Text Search
+    // =========================================================================
+
+    pub const SearchResult = struct {
+        page: usize,
+        offset: usize,
+        context: []const u8,
+    };
+
+    /// Search for text across all pages. Returns matches with page, offset, and context.
+    /// Caller must free the returned slice and each context string.
+    pub fn search(self: *Document, allocator: std.mem.Allocator, query: []const u8) ![]SearchResult {
+        if (query.len == 0) return allocator.alloc(SearchResult, 0);
+
+        var results: std.ArrayList(SearchResult) = .empty;
+        errdefer {
+            for (results.items) |r| {
+                allocator.free(r.context);
+            }
+            results.deinit(allocator);
+        }
+
+        // Lowercase query for case-insensitive search
+        const query_lower = try allocator.alloc(u8, query.len);
+        defer allocator.free(query_lower);
+        for (query, 0..) |c, idx| {
+            query_lower[idx] = asciiToLower(c);
+        }
+
+        for (0..self.pages.items.len) |page_idx| {
+            const page_text = self.extractTextStructured(page_idx, allocator) catch continue;
+            defer allocator.free(page_text);
+
+            if (page_text.len == 0) continue;
+
+            // Lowercase page text for comparison
+            const text_lower = try allocator.alloc(u8, page_text.len);
+            defer allocator.free(text_lower);
+            for (page_text, 0..) |c, idx| {
+                text_lower[idx] = asciiToLower(c);
+            }
+
+            // Find all occurrences
+            var pos: usize = 0;
+            while (pos + query_lower.len <= text_lower.len) {
+                if (std.mem.indexOf(u8, text_lower[pos..], query_lower)) |match_offset| {
+                    const abs_offset = pos + match_offset;
+
+                    // Build context snippet (~50 chars before/after)
+                    const ctx_start = if (abs_offset > 50) abs_offset - 50 else 0;
+                    const ctx_end = @min(abs_offset + query.len + 50, page_text.len);
+                    const context = try allocator.dupe(u8, page_text[ctx_start..ctx_end]);
+
+                    try results.append(allocator, .{
+                        .page = page_idx,
+                        .offset = abs_offset,
+                        .context = context,
+                    });
+
+                    pos = abs_offset + query_lower.len;
+                } else break;
+            }
+        }
+
+        return results.toOwnedSlice(allocator);
+    }
+
+    pub fn freeSearchResults(allocator: std.mem.Allocator, results: []SearchResult) void {
+        for (results) |r| {
+            allocator.free(r.context);
+        }
+        allocator.free(results);
+    }
+
+    fn asciiToLower(c: u8) u8 {
+        return if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+
+    // =========================================================================
+    // Feature 5: Link/Annotation extraction
+    // =========================================================================
+
+    pub const Link = struct {
+        rect: [4]f64,
+        uri: ?[]const u8,
+        dest_page: ?usize,
+    };
+
+    /// Extract link annotations from a page.
+    /// Caller must free the returned slice.
+    pub fn getPageLinks(self: *Document, page_idx: usize, allocator: std.mem.Allocator) ![]Link {
+        if (page_idx >= self.pages.items.len) return error.PageNotFound;
+
+        const arena = self.parsing_arena.allocator();
+        const page = self.pages.items[page_idx];
+
+        const annots_obj = page.dict.get("Annots") orelse return allocator.alloc(Link, 0);
+
+        const annots_arr = switch (annots_obj) {
+            .array => |a| a,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch
+                    return allocator.alloc(Link, 0);
+                break :blk switch (obj) {
+                    .array => |a| a,
+                    else => return allocator.alloc(Link, 0),
+                };
+            },
+            else => return allocator.alloc(Link, 0),
+        };
+
+        var links: std.ArrayList(Link) = .empty;
+        errdefer {
+            for (links.items) |link| {
+                if (link.uri) |u| allocator.free(u);
+            }
+            links.deinit(allocator);
+        }
+
+        for (annots_arr) |annot_obj| {
+            const annot_dict = switch (annot_obj) {
+                .dict => |d| d,
+                .reference => |r| blk: {
+                    const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch continue;
+                    break :blk switch (obj) {
+                        .dict => |d| d,
+                        else => continue,
+                    };
+                },
+                else => continue,
+            };
+
+            // Only process /Link annotations
+            const subtype = annot_dict.getName("Subtype") orelse continue;
+            if (!std.mem.eql(u8, subtype, "Link")) continue;
+
+            // Parse /Rect
+            const rect = parseRect(annot_dict) orelse continue;
+
+            // Try /A (action dict) first
+            var uri: ?[]const u8 = null;
+            var dest_page: ?usize = null;
+
+            if (annot_dict.get("A")) |action_obj| {
+                const action = switch (action_obj) {
+                    .dict => |d| d,
+                    .reference => |r| blk: {
+                        const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch null;
+                        break :blk if (obj) |o| switch (o) {
+                            .dict => |d| d,
+                            else => null,
+                        } else null;
+                    },
+                    else => null,
+                };
+
+                if (action) |act| {
+                    const action_type = act.getName("S");
+                    if (action_type) |s| {
+                        if (std.mem.eql(u8, s, "URI")) {
+                            if (act.getString("URI")) |u| {
+                                uri = try allocator.dupe(u8, u);
+                            }
+                        } else if (std.mem.eql(u8, s, "GoTo")) {
+                            // Internal link
+                            if (act.get("D")) |d_obj| {
+                                dest_page = self.resolveDestToPage(d_obj);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Try /Dest if no /A
+            if (uri == null and dest_page == null) {
+                if (annot_dict.get("Dest")) |dest_obj| {
+                    dest_page = self.resolveDestToPage(dest_obj);
+                }
+            }
+
+            try links.append(allocator, .{
+                .rect = rect,
+                .uri = uri,
+                .dest_page = dest_page,
+            });
+        }
+
+        return links.toOwnedSlice(allocator);
+    }
+
+    pub fn freeLinks(allocator: std.mem.Allocator, links: []Link) void {
+        for (links) |link| {
+            if (link.uri) |u| allocator.free(u);
+        }
+        allocator.free(links);
+    }
+
+    fn parseRect(dict: Object.Dict) ?[4]f64 {
+        const rect_arr = dict.getArray("Rect") orelse return null;
+        if (rect_arr.len < 4) return null;
+        return .{
+            objToF64(rect_arr[0]) orelse return null,
+            objToF64(rect_arr[1]) orelse return null,
+            objToF64(rect_arr[2]) orelse return null,
+            objToF64(rect_arr[3]) orelse return null,
+        };
+    }
+
+    fn objToF64(obj: Object) ?f64 {
+        return switch (obj) {
+            .real => |r| r,
+            .integer => |i| @floatFromInt(i),
+            else => null,
+        };
+    }
+
+    fn resolveDestToPage(self: *Document, dest_obj: Object) ?usize {
+        const arena = self.parsing_arena.allocator();
+        // Destination can be an array [page_ref /Fit ...] or a name (named dest)
+        const arr = switch (dest_obj) {
+            .array => |a| a,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch return null;
+                break :blk switch (obj) {
+                    .array => |a| a,
+                    else => return null,
+                };
+            },
+            else => return null,
+        };
+        if (arr.len == 0) return null;
+
+        // First element should be a page reference
+        const page_ref = switch (arr[0]) {
+            .reference => |r| r,
+            else => return null,
+        };
+
+        // Match against our page list
+        for (self.pages.items, 0..) |p, idx| {
+            if (p.ref.eql(page_ref)) return idx;
+        }
+        return null;
+    }
+
+    // =========================================================================
+    // Feature 6: Image Detection
+    // =========================================================================
+
+    pub const ImageInfo = struct {
+        rect: [4]f64,
+        width: u32,
+        height: u32,
+    };
+
+    /// Detect images on a page and report their positions and dimensions.
+    /// Caller must free the returned slice.
+    pub fn getPageImages(self: *Document, page_idx: usize, allocator: std.mem.Allocator) ![]ImageInfo {
+        if (page_idx >= self.pages.items.len) return error.PageNotFound;
+
+        const arena = self.parsing_arena.allocator();
+        const page = self.pages.items[page_idx];
+
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch_allocator = scratch_arena.allocator();
+
+        const content = pagetree.getPageContents(
+            arena,
+            scratch_allocator,
+            self.data,
+            &self.xref_table,
+            page,
+            &self.object_cache,
+        ) catch return allocator.alloc(ImageInfo, 0);
+
+        if (content.len == 0) return allocator.alloc(ImageInfo, 0);
+
+        // Parse content stream for Do operators and track CTM
+        var images: std.ArrayList(ImageInfo) = .empty;
+        errdefer images.deinit(allocator);
+
+        var lexer = interpreter.ContentLexer.init(scratch_allocator, content);
+        var operands: [128]interpreter.Operand = undefined;
+        var operand_count: usize = 0;
+
+        // Simple CTM tracking (only handles cm and basic state)
+        var ctm: [6]f64 = .{ 1, 0, 0, 1, 0, 0 }; // identity
+
+        while (try lexer.next()) |token| {
+            if (pushOperand(&operands, &operand_count, token)) continue;
+
+            const op = token.operator;
+            if (op.len > 0) {
+                if (std.mem.eql(u8, op, "cm") and operand_count >= 6) {
+                    // Concatenate matrix
+                    const new: [6]f64 = .{
+                        operands[0].number, operands[1].number,
+                        operands[2].number, operands[3].number,
+                        operands[4].number, operands[5].number,
+                    };
+                    ctm = multiplyMatrix(new, ctm);
+                } else if (std.mem.eql(u8, op, "Do") and operand_count >= 1 and operands[0] == .name) {
+                    // Check if this XObject is an Image
+                    if (self.resolveXObjectImage(page, operands[0].name)) |img_info| {
+                        // Transform unit square by CTM to get image rect
+                        const w: f64 = @floatFromInt(img_info.width);
+                        const h: f64 = @floatFromInt(img_info.height);
+                        _ = h;
+                        _ = w;
+                        try images.append(allocator, .{
+                            .rect = .{
+                                ctm[4], // x0
+                                ctm[5], // y0
+                                ctm[4] + ctm[0], // x1 (x0 + scale_x)
+                                ctm[5] + ctm[3], // y1 (y0 + scale_y)
+                            },
+                            .width = img_info.width,
+                            .height = img_info.height,
+                        });
+                    }
+                }
+            }
+
+            operand_count = 0;
+        }
+
+        return images.toOwnedSlice(allocator);
+    }
+
+    fn multiplyMatrix(a: [6]f64, b: [6]f64) [6]f64 {
+        return .{
+            a[0] * b[0] + a[1] * b[2],
+            a[0] * b[1] + a[1] * b[3],
+            a[2] * b[0] + a[3] * b[2],
+            a[2] * b[1] + a[3] * b[3],
+            a[4] * b[0] + a[5] * b[2] + b[4],
+            a[4] * b[1] + a[5] * b[3] + b[5],
+        };
+    }
+
+    const XObjectImageInfo = struct { width: u32, height: u32 };
+
+    fn resolveXObjectImage(self: *Document, page: Page, name: []const u8) ?XObjectImageInfo {
+        const arena = self.parsing_arena.allocator();
+        const resources = page.resources orelse return null;
+
+        const xobjects_obj = resources.get("XObject") orelse return null;
+        const xobjects = switch (xobjects_obj) {
+            .dict => |d| d,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch return null;
+                break :blk switch (obj) {
+                    .dict => |d| d,
+                    else => return null,
+                };
+            },
+            else => return null,
+        };
+
+        const xobj_obj = xobjects.get(name) orelse return null;
+        const xobj_stream = switch (xobj_obj) {
+            .stream => |s| s,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch return null;
+                break :blk switch (obj) {
+                    .stream => |s| s,
+                    else => return null,
+                };
+            },
+            else => return null,
+        };
+
+        const subtype = xobj_stream.dict.getName("Subtype") orelse return null;
+        if (!std.mem.eql(u8, subtype, "Image")) return null;
+
+        const width: u32 = if (xobj_stream.dict.getInt("Width")) |w| @intCast(w) else return null;
+        const height: u32 = if (xobj_stream.dict.getInt("Height")) |h| @intCast(h) else return null;
+
+        return .{ .width = width, .height = height };
+    }
+
+    pub fn freeImages(allocator: std.mem.Allocator, images: []ImageInfo) void {
+        allocator.free(images);
+    }
+
+    // =========================================================================
+    // Feature 7: Form Fields (/AcroForm)
+    // =========================================================================
+
+    pub const FieldType = enum { text, button, choice, signature, unknown };
+
+    pub const FormField = struct {
+        name: []const u8,
+        value: ?[]const u8,
+        field_type: FieldType,
+        rect: ?[4]f64,
+    };
+
+    /// Extract form fields from the document's AcroForm.
+    /// Caller must free the returned slice and each name/value string.
+    pub fn getFormFields(self: *Document, allocator: std.mem.Allocator) ![]FormField {
+        const arena = self.parsing_arena.allocator();
+
+        // Get catalog
+        const root_ref = switch (self.xref_table.trailer.get("Root") orelse return allocator.alloc(FormField, 0)) {
+            .reference => |r| r,
+            else => return allocator.alloc(FormField, 0),
+        };
+        const catalog = pagetree.resolveRef(arena, self.data, &self.xref_table, root_ref, &self.object_cache) catch
+            return allocator.alloc(FormField, 0);
+        const catalog_dict = switch (catalog) {
+            .dict => |d| d,
+            else => return allocator.alloc(FormField, 0),
+        };
+
+        // Get /AcroForm dict
+        const acroform_obj = catalog_dict.get("AcroForm") orelse return allocator.alloc(FormField, 0);
+        const acroform = switch (acroform_obj) {
+            .dict => |d| d,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch
+                    return allocator.alloc(FormField, 0);
+                break :blk switch (obj) {
+                    .dict => |d| d,
+                    else => return allocator.alloc(FormField, 0),
+                };
+            },
+            else => return allocator.alloc(FormField, 0),
+        };
+
+        // Get /Fields array
+        const fields_obj = acroform.get("Fields") orelse return allocator.alloc(FormField, 0);
+        const fields_arr = switch (fields_obj) {
+            .array => |a| a,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch
+                    return allocator.alloc(FormField, 0);
+                break :blk switch (obj) {
+                    .array => |a| a,
+                    else => return allocator.alloc(FormField, 0),
+                };
+            },
+            else => return allocator.alloc(FormField, 0),
+        };
+
+        var results: std.ArrayList(FormField) = .empty;
+        errdefer {
+            for (results.items) |f| {
+                allocator.free(f.name);
+                if (f.value) |v| allocator.free(v);
+            }
+            results.deinit(allocator);
+        }
+
+        // Walk fields (may have /Kids for hierarchical fields)
+        for (fields_arr) |field_obj| {
+            try self.collectFormFields(allocator, arena, field_obj, "", &results);
+        }
+
+        return results.toOwnedSlice(allocator);
+    }
+
+    fn collectFormFields(
+        self: *Document,
+        allocator: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        field_obj: Object,
+        parent_name: []const u8,
+        results: *std.ArrayList(FormField),
+    ) !void {
+        const field_dict = switch (field_obj) {
+            .dict => |d| d,
+            .reference => |r| blk: {
+                const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch return;
+                break :blk switch (obj) {
+                    .dict => |d| d,
+                    else => return,
+                };
+            },
+            else => return,
+        };
+
+        // Build full name: parent.child
+        const partial_name = field_dict.getString("T") orelse "";
+        const full_name = if (parent_name.len > 0 and partial_name.len > 0) blk: {
+            const name = try allocator.alloc(u8, parent_name.len + 1 + partial_name.len);
+            @memcpy(name[0..parent_name.len], parent_name);
+            name[parent_name.len] = '.';
+            @memcpy(name[parent_name.len + 1 ..], partial_name);
+            break :blk name;
+        } else if (partial_name.len > 0)
+            try allocator.dupe(u8, partial_name)
+        else
+            try allocator.dupe(u8, parent_name);
+
+        // Check for /Kids (hierarchical field)
+        if (field_dict.get("Kids")) |kids_obj| {
+            const kids_arr = switch (kids_obj) {
+                .array => |a| a,
+                .reference => |r| blk: {
+                    const obj = pagetree.resolveRef(arena, self.data, &self.xref_table, r, &self.object_cache) catch {
+                        allocator.free(full_name);
+                        return;
+                    };
+                    break :blk switch (obj) {
+                        .array => |a| a,
+                        else => {
+                            allocator.free(full_name);
+                            return;
+                        },
+                    };
+                },
+                else => {
+                    allocator.free(full_name);
+                    return;
+                },
+            };
+
+            for (kids_arr) |kid| {
+                try self.collectFormFields(allocator, arena, kid, full_name, results);
+            }
+            allocator.free(full_name);
+            return;
+        }
+
+        // Leaf field: extract type, value, rect
+        const ft_name = field_dict.getName("FT");
+        const field_type: FieldType = if (ft_name) |ft|
+            if (std.mem.eql(u8, ft, "Tx"))
+                .text
+            else if (std.mem.eql(u8, ft, "Btn"))
+                .button
+            else if (std.mem.eql(u8, ft, "Ch"))
+                .choice
+            else if (std.mem.eql(u8, ft, "Sig"))
+                .signature
+            else
+                .unknown
+        else
+            .unknown;
+
+        const value = if (field_dict.getString("V")) |v|
+            try allocator.dupe(u8, v)
+        else
+            null;
+
+        const rect = parseRect(field_dict);
+
+        try results.append(allocator, .{
+            .name = full_name,
+            .value = value,
+            .field_type = field_type,
+            .rect = rect,
+        });
+    }
+
+    pub fn freeFormFields(allocator: std.mem.Allocator, fields: []FormField) void {
+        for (fields) |f| {
+            allocator.free(f.name);
+            if (f.value) |v| allocator.free(v);
+        }
+        allocator.free(fields);
+    }
 };
+
+/// Decode a PDF string that may be UTF-16BE (BOM-prefixed) into UTF-8.
+/// If the string starts with \xFE\xFF it's UTF-16BE; otherwise it's
+/// PDFDocEncoding (≈ Latin-1 for the printable range).
+/// Caller owns the returned slice.
+pub fn decodePdfString(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    // Check for UTF-16BE BOM
+    if (raw.len >= 2 and raw[0] == 0xFE and raw[1] == 0xFF) {
+        const payload = raw[2..]; // skip BOM
+        const n_units = payload.len / 2;
+
+        // Decode UTF-16BE to UTF-8
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+        try result.ensureTotalCapacity(allocator, n_units * 3); // worst case
+
+        var i: usize = 0;
+        while (i + 1 < payload.len) {
+            const hi: u16 = @as(u16, payload[i]) << 8;
+            const lo: u16 = payload[i + 1];
+            const unit: u16 = hi | lo;
+            i += 2;
+
+            var codepoint: u21 = undefined;
+            if (unit >= 0xD800 and unit <= 0xDBFF) {
+                // High surrogate — need low surrogate
+                if (i + 1 < payload.len) {
+                    const hi2: u16 = @as(u16, payload[i]) << 8;
+                    const lo2: u16 = payload[i + 1];
+                    const unit2: u16 = hi2 | lo2;
+                    i += 2;
+                    if (unit2 >= 0xDC00 and unit2 <= 0xDFFF) {
+                        codepoint = 0x10000 + (@as(u21, unit - 0xD800) << 10) + @as(u21, unit2 - 0xDC00);
+                    } else {
+                        codepoint = 0xFFFD; // replacement
+                    }
+                } else {
+                    codepoint = 0xFFFD;
+                }
+            } else if (unit >= 0xDC00 and unit <= 0xDFFF) {
+                codepoint = 0xFFFD; // unpaired low surrogate
+            } else {
+                codepoint = unit;
+            }
+
+            // Encode as UTF-8
+            if (codepoint < 0x80) {
+                try result.append(allocator, @intCast(codepoint));
+            } else if (codepoint < 0x800) {
+                try result.append(allocator, @intCast(0xC0 | (codepoint >> 6)));
+                try result.append(allocator, @intCast(0x80 | (codepoint & 0x3F)));
+            } else if (codepoint < 0x10000) {
+                try result.append(allocator, @intCast(0xE0 | (codepoint >> 12)));
+                try result.append(allocator, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+                try result.append(allocator, @intCast(0x80 | (codepoint & 0x3F)));
+            } else {
+                try result.append(allocator, @intCast(0xF0 | (codepoint >> 18)));
+                try result.append(allocator, @intCast(0x80 | ((codepoint >> 12) & 0x3F)));
+                try result.append(allocator, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+                try result.append(allocator, @intCast(0x80 | (codepoint & 0x3F)));
+            }
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    // Not UTF-16BE — treat as PDFDocEncoding (Latin-1 compatible for ASCII).
+    // For bytes 128-255, encode as UTF-8.
+    var needs_encoding = false;
+    for (raw) |c| {
+        if (c >= 0x80) {
+            needs_encoding = true;
+            break;
+        }
+    }
+
+    if (!needs_encoding) {
+        return allocator.dupe(u8, raw);
+    }
+
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, raw.len * 2);
+
+    for (raw) |c| {
+        if (c < 0x80) {
+            try result.append(allocator, c);
+        } else {
+            // Latin-1 to UTF-8
+            try result.append(allocator, 0xC0 | (c >> 6));
+            try result.append(allocator, 0x80 | (c & 0x3F));
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
 
 /// Context for text extraction (allows Form XObject recursion)
 const ExtractionContext = struct {

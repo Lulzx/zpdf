@@ -302,6 +302,255 @@ test "inline image does not corrupt text extraction" {
     try std.testing.expect(std.mem.indexOf(u8, output.items, "After") != null);
 }
 
+// =========================================================================
+// New feature integration tests
+// =========================================================================
+
+test "metadata extraction" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMetadataPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const meta = doc.metadata();
+    try std.testing.expect(meta.title != null);
+    try std.testing.expectEqualStrings("Test Document", meta.title.?);
+    try std.testing.expectEqualStrings("Test Author", meta.author.?);
+    try std.testing.expectEqualStrings("Test Subject", meta.subject.?);
+    try std.testing.expectEqualStrings("test, pdf, zpdf", meta.keywords.?);
+    try std.testing.expectEqualStrings("TestGenerator", meta.creator.?);
+    try std.testing.expectEqualStrings("zpdf", meta.producer.?);
+}
+
+test "metadata returns empty for PDF without Info dict" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "No metadata");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const meta = doc.metadata();
+    try std.testing.expect(meta.title == null);
+    try std.testing.expect(meta.author == null);
+}
+
+test "outline extraction" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateOutlinePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const outline_items = try doc.getOutline(allocator);
+    defer {
+        for (outline_items) |item| {
+            allocator.free(@constCast(item.title));
+        }
+        allocator.free(outline_items);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), outline_items.len);
+    try std.testing.expectEqualStrings("Chapter 1", outline_items[0].title);
+    try std.testing.expect(outline_items[0].page != null);
+    try std.testing.expectEqual(@as(usize, 0), outline_items[0].page.?);
+    try std.testing.expectEqual(@as(u32, 0), outline_items[0].level);
+}
+
+test "outline returns empty for PDF without outlines" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "No outlines");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const outline_items = try doc.getOutline(allocator);
+    defer allocator.free(outline_items);
+
+    try std.testing.expectEqual(@as(usize, 0), outline_items.len);
+}
+
+test "link extraction" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateLinkPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const links = try doc.getPageLinks(0, allocator);
+    defer zpdf.Document.freeLinks(allocator, links);
+
+    try std.testing.expectEqual(@as(usize, 1), links.len);
+    try std.testing.expect(links[0].uri != null);
+    try std.testing.expectEqualStrings("https://example.com", links[0].uri.?);
+    // Check rect
+    try std.testing.expectApproxEqRel(@as(f64, 100), links[0].rect[0], 0.01);
+    try std.testing.expectApproxEqRel(@as(f64, 690), links[0].rect[1], 0.01);
+}
+
+test "links returns empty for page without annotations" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "No links");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const links = try doc.getPageLinks(0, allocator);
+    defer allocator.free(links);
+
+    try std.testing.expectEqual(@as(usize, 0), links.len);
+}
+
+test "form field extraction" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateFormFieldPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const fields = try doc.getFormFields(allocator);
+    defer zpdf.Document.freeFormFields(allocator, fields);
+
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+
+    // Find text field
+    var found_text = false;
+    var found_button = false;
+    for (fields) |f| {
+        if (std.mem.eql(u8, f.name, "name")) {
+            found_text = true;
+            try std.testing.expect(f.field_type == .text);
+            try std.testing.expect(f.value != null);
+            try std.testing.expectEqualStrings("John Doe", f.value.?);
+        }
+        if (std.mem.eql(u8, f.name, "submit")) {
+            found_button = true;
+            try std.testing.expect(f.field_type == .button);
+        }
+    }
+    try std.testing.expect(found_text);
+    try std.testing.expect(found_button);
+}
+
+test "form fields returns empty for PDF without AcroForm" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "No form");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const fields = try doc.getFormFields(allocator);
+    defer allocator.free(fields);
+
+    try std.testing.expectEqual(@as(usize, 0), fields.len);
+}
+
+test "text search" {
+    const allocator = std.testing.allocator;
+
+    const pages = &[_][]const u8{ "Hello World", "Goodbye World", "Hello Again" };
+    const pdf_data = try testpdf.generateMultiPagePdf(allocator, pages);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    // Search for "Hello" - should find 2 matches
+    const results = try doc.search(allocator, "Hello");
+    defer zpdf.Document.freeSearchResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(usize, 0), results[0].page); // Page 0
+    try std.testing.expectEqual(@as(usize, 2), results[1].page); // Page 2
+}
+
+test "text search case insensitive" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "Hello World");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const results = try doc.search(allocator, "hello");
+    defer zpdf.Document.freeSearchResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "text search no matches" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "Hello World");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    const results = try doc.search(allocator, "notfound");
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "page labels" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generatePageLabelPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    // Page 0 should be "i" (lowercase roman)
+    const label0 = doc.getPageLabel(allocator, 0);
+    defer if (label0) |l| allocator.free(l);
+    try std.testing.expect(label0 != null);
+    try std.testing.expectEqualStrings("i", label0.?);
+
+    // Page 1 should be "ii"
+    const label1 = doc.getPageLabel(allocator, 1);
+    defer if (label1) |l| allocator.free(l);
+    try std.testing.expect(label1 != null);
+    try std.testing.expectEqualStrings("ii", label1.?);
+
+    // Page 2 should be "1" (decimal, starting at 1)
+    const label2 = doc.getPageLabel(allocator, 2);
+    defer if (label2) |l| allocator.free(l);
+    try std.testing.expect(label2 != null);
+    try std.testing.expectEqualStrings("1", label2.?);
+}
+
+test "page labels returns null for PDF without PageLabels" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateMinimalPdf(allocator, "No labels");
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.default());
+    defer doc.close();
+
+    const label = doc.getPageLabel(allocator, 0);
+    try std.testing.expect(label == null);
+}
+
 test "superscript positioning does not insert spurious newline" {
     const allocator = std.testing.allocator;
 
