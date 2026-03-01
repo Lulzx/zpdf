@@ -293,6 +293,154 @@ pub fn generateCIDFontPdf(allocator: std.mem.Allocator) ![]u8 {
     return pdf.toOwnedSlice(allocator);
 }
 
+/// Generate a PDF whose leaf page node omits /Type (valid but often rejected).
+/// Tests Fix 2: pagetree /Type default inference.
+pub fn generatePdfWithoutPageType(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Object 3: Page dict intentionally omits /Type /Page
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n");
+    try writer.writeAll("<< /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n");
+    try writer.writeAll("endobj\n");
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(allocator);
+    var cw = content.writer(allocator);
+    try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n");
+    try cw.print("({s}) Tj\n", .{text});
+    try cw.writeAll("ET\n");
+
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.items.len});
+    try writer.writeAll(content.items);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("0000000000 65535 f \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj1_offset, obj2_offset });
+    try writer.print("{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj3_offset, obj4_offset, obj5_offset });
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF with an inline image (BI/EI block) surrounded by text.
+/// Tests Fix 1: inline image skipping in the content stream lexer.
+pub fn generateInlineImagePdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    // Content stream: text, inline image, text
+    // The inline image bytes \xAA\xBB are arbitrary binary - they won't form "EI"
+    const content =
+        "BT\n/F1 12 Tf\n100 700 Td\n(Before) Tj\nET\n" ++
+        "BI\n/W 2 /H 2 /CS /G /BPC 8\nID\n\xAA\xBB\xCC\xDD\nEI\n" ++
+        "BT\n/F1 12 Tf\n100 650 Td\n(After) Tj\nET\n";
+
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
+    try writer.writeAll(content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("0000000000 65535 f \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj1_offset, obj2_offset });
+    try writer.print("{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj3_offset, obj4_offset, obj5_offset });
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
+/// Generate a PDF with superscript text at a slightly elevated Y position.
+/// Tests the superscript/subscript newline-suppression fix: a Tm whose Y
+/// shift is smaller than 0.7 * max(current_font, last_text_font) should not
+/// emit a newline.
+pub fn generateSuperscriptPdf(allocator: std.mem.Allocator) ![]u8 {
+    var pdf: std.ArrayList(u8) = .empty;
+    errdefer pdf.deinit(allocator);
+    var writer = pdf.writer(allocator);
+
+    try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    const obj1_offset = pdf.items.len;
+    try writer.writeAll("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    const obj2_offset = pdf.items.len;
+    try writer.writeAll("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    const obj3_offset = pdf.items.len;
+    try writer.writeAll("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ");
+    try writer.writeAll("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    // Main text at Y=700 (12pt), superscript "2" at Y=707 (7pt), then back to Y=700 (12pt).
+    // Y shift = 7, threshold = max(7,12)*0.7 = 8.4 → no newline emitted.
+    const content =
+        "BT\n" ++
+        "/F1 12 Tf\n" ++
+        "1 0 0 1 100 700 Tm\n" ++
+        "(Hello) Tj\n" ++
+        "/F1 7 Tf\n" ++
+        "1 0 0 1 110 707 Tm\n" ++
+        "(2) Tj\n" ++
+        "/F1 12 Tf\n" ++
+        "1 0 0 1 120 700 Tm\n" ++
+        "( World) Tj\n" ++
+        "ET\n";
+
+    const obj4_offset = pdf.items.len;
+    try writer.print("4 0 obj\n<< /Length {} >>\nstream\n", .{content.len});
+    try writer.writeAll(content);
+    try writer.writeAll("\nendstream\nendobj\n");
+
+    const obj5_offset = pdf.items.len;
+    try writer.writeAll("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica ");
+    try writer.writeAll("/Encoding /WinAnsiEncoding >>\nendobj\n");
+
+    const xref_offset = pdf.items.len;
+    try writer.writeAll("xref\n0 6\n");
+    try writer.print("0000000000 65535 f \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj1_offset, obj2_offset });
+    try writer.print("{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n", .{ obj3_offset, obj4_offset, obj5_offset });
+    try writer.writeAll("trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    try writer.print("startxref\n{}\n%%EOF\n", .{xref_offset});
+
+    return pdf.toOwnedSlice(allocator);
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================

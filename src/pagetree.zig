@@ -232,8 +232,9 @@ fn walkPageTree(
         else => return PageTreeError.InvalidPageTree,
     };
 
-    // Check Type
-    const type_name = dict.getName("Type") orelse return PageTreeError.InvalidPageTree;
+    // Check Type — some generators omit /Type; infer from structure
+    const type_name = dict.getName("Type") orelse
+        if (dict.get("Kids") != null) "Pages" else "Page";
 
     // Get inherited attributes at this level
     const mediabox = extractBox(dict, "MediaBox") orelse inherited_mediabox;
@@ -253,7 +254,7 @@ fn walkPageTree(
 
     if (std.mem.eql(u8, type_name, "Pages")) {
         // Intermediate node - recurse into Kids
-        const kids = dict.getArray("Kids") orelse return PageTreeError.InvalidPageTree;
+        const kids = dict.getArray("Kids") orelse return;
 
         for (kids) |kid| {
             const kid_ref = switch (kid) {

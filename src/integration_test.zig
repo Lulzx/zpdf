@@ -265,3 +265,62 @@ test "extract text from incremental PDF - gets updated content" {
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Updated") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Original") == null);
 }
+
+test "page tree tolerates leaf node without /Type" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generatePdfWithoutPageType(allocator, "NoTypeTest");
+    defer allocator.free(pdf_data);
+
+    // Should still open and report 1 page (Fix 2: /Type default inference)
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    try std.testing.expectEqual(@as(usize, 1), doc.pageCount());
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    try doc.extractText(0, output.writer(allocator));
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "NoTypeTest") != null);
+}
+
+test "inline image does not corrupt text extraction" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateInlineImagePdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    try doc.extractText(0, output.writer(allocator));
+
+    // Both text spans surrounding the inline image must be present (Fix 1: BI/EI skip)
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "Before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "After") != null);
+}
+
+test "superscript positioning does not insert spurious newline" {
+    const allocator = std.testing.allocator;
+
+    const pdf_data = try testpdf.generateSuperscriptPdf(allocator);
+    defer allocator.free(pdf_data);
+
+    const doc = try zpdf.Document.openFromMemory(allocator, pdf_data, zpdf.ErrorConfig.permissive());
+    defer doc.close();
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    try doc.extractText(0, output.writer(allocator));
+
+    // All three text chunks must be present
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "Hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "World") != null);
+
+    // No newline should appear between them: the 7-unit Y shift for the
+    // superscript is below the threshold max(7,12)*0.7=8.4 (Fix 8)
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\n") == null);
+}

@@ -123,31 +123,31 @@ pub fn ContentInterpreter(comptime Writer: type) type {
         /// Process a content stream
         pub fn process(self: *Self, content: []const u8) !void {
             var lexer = ContentLexer.init(self.allocator, content);
-            var operand_stack: [64]Operand = undefined;
+            var operand_stack: [128]Operand = undefined;
             var stack_size: usize = 0;
 
             while (try lexer.next()) |token| {
                 switch (token) {
                     .number => |n| {
-                        if (stack_size < 64) {
+                        if (stack_size < 128) {
                             operand_stack[stack_size] = .{ .number = n };
                             stack_size += 1;
                         }
                     },
                     .string => |s| {
-                        if (stack_size < 64) {
+                        if (stack_size < 128) {
                             operand_stack[stack_size] = .{ .string = s };
                             stack_size += 1;
                         }
                     },
                     .hex_string => |s| {
-                        if (stack_size < 64) {
+                        if (stack_size < 128) {
                             operand_stack[stack_size] = .{ .hex_string = s };
                             stack_size += 1;
                         }
                     },
                     .name => |n| {
-                        if (stack_size < 64) {
+                        if (stack_size < 128) {
                             operand_stack[stack_size] = .{ .name = n };
                             stack_size += 1;
                         }
@@ -157,7 +157,7 @@ pub fn ContentInterpreter(comptime Writer: type) type {
                         stack_size = 0;
                     },
                     .array => |arr| {
-                        if (stack_size < 64) {
+                        if (stack_size < 128) {
                             operand_stack[stack_size] = .{ .array = arr };
                             stack_size += 1;
                         }
@@ -498,7 +498,7 @@ pub const ContentLexer = struct {
     allocator: std.mem.Allocator,
 
     // Temporary storage for arrays
-    array_buffer: [256]Operand = undefined,
+    array_buffer: [512]Operand = undefined,
 
     pub const Token = union(enum) {
         number: f64,
@@ -556,7 +556,12 @@ pub const ContentLexer = struct {
 
         // Operator (identifier)
         if (isAlpha(c) or c == '\'' or c == '"' or c == '*') {
-            return Token{ .operator = self.scanOperator() };
+            const op = self.scanOperator();
+            if (std.mem.eql(u8, op, "BI")) {
+                self.skipInlineImage();
+                return self.next();
+            }
+            return Token{ .operator = op };
         }
 
         // Unknown - skip
@@ -763,12 +768,28 @@ pub const ContentLexer = struct {
         return self.data[start..self.pos];
     }
 
+    fn skipInlineImage(self: *ContentLexer) void {
+        while (self.pos + 1 < self.data.len) {
+            if (self.data[self.pos] == 'E' and self.data[self.pos + 1] == 'I') {
+                const prev_ws = self.pos == 0 or isWhitespace(self.data[self.pos - 1]);
+                const next_ws = self.pos + 2 >= self.data.len or
+                    isWhitespace(self.data[self.pos + 2]) or
+                    isDelimiter(self.data[self.pos + 2]);
+                if (prev_ws and next_ws) {
+                    self.pos += 2;
+                    return;
+                }
+            }
+            self.pos += 1;
+        }
+    }
+
     fn scanArray(self: *ContentLexer) []const Operand {
         self.pos += 1; // Skip '['
 
         var count: usize = 0;
 
-        while (self.pos < self.data.len and count < 256) {
+        while (self.pos < self.data.len and count < 512) {
             self.skipWhitespaceAndComments();
 
             if (self.pos >= self.data.len) break;
@@ -977,6 +998,32 @@ test "lexer negative numbers" {
 
     const n2 = (try lexer.next()).?;
     try std.testing.expectApproxEqAbs(@as(f64, -3.14), n2.number, 0.001);
+}
+
+test "lexer skips BI/EI inline image block" {
+    // Content stream with an inline image sandwiched between two Tj operators.
+    // The binary bytes \xAA\xBB\xCC are safe: they won't form a whitespace-bounded "EI".
+    const content = "BT (Before) Tj BI /W 2 /H 2 ID \xAA\xBB\xCC EI (After) Tj ET";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = ContentLexer.init(arena.allocator(), content);
+
+    var tj_count: usize = 0;
+    while (try lexer.next()) |tok| {
+        switch (tok) {
+            .operator => |op| {
+                // BI and EI must never surface as operators — they are consumed
+                try std.testing.expect(!std.mem.eql(u8, op, "BI"));
+                try std.testing.expect(!std.mem.eql(u8, op, "EI"));
+                if (std.mem.eql(u8, op, "Tj")) tj_count += 1;
+            },
+            else => {},
+        }
+    }
+
+    // Both Tj operators (for "Before" and "After") must be present
+    try std.testing.expectEqual(@as(usize, 2), tj_count);
 }
 
 test "lexer text operators" {

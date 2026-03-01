@@ -124,8 +124,10 @@ pub const CffParser = struct {
 
     fn parseCharset(self: *CffParser) !void {
         // Pre-ISO standard CFF charsets
-        if (self.charset_offset == 0) { // ISOAdobe
-            // TODO: Populate standard charset
+        if (self.charset_offset == 0) { // ISOAdobe: identity mapping GID -> SID for GIDs 0-228
+            const n = @min(self.charstrings_index.count, 229);
+            self.charsets = try self.allocator.alloc(u16, n);
+            for (0..n) |i| self.charsets[i] = @intCast(i);
             return;
         } else if (self.charset_offset == 1) { // Expert
             return;
@@ -379,15 +381,87 @@ const DictParser = struct {
             self.pos += 1;
             return -(@as(i32, b0) - 251) * 256 - @as(i32, b1) - 108;
         } else if (b0 == 30) {
-             // Real number - skip for now, logic is complex
-             // Just consume nibbles until 0xF
-             while (self.pos < self.data.len) {
-                 const b = self.data[self.pos];
-                 self.pos += 1;
-                 if ((b & 0xF) == 0xF or (b >> 4) == 0xF) break;
-             }
-             return 0; // Placeholder
+            // Real number: packed nibbles -> ASCII -> float -> round to i32
+            var buf: [32]u8 = undefined;
+            var buf_len: usize = 0;
+            outer: while (self.pos < self.data.len) {
+                const b = self.data[self.pos];
+                self.pos += 1;
+                inline for (0..2) |half| {
+                    const nibble: u8 = if (half == 0) (b >> 4) else (b & 0xF);
+                    switch (nibble) {
+                        0...9 => {
+                            if (buf_len < buf.len) {
+                                buf[buf_len] = '0' + nibble;
+                                buf_len += 1;
+                            }
+                        },
+                        0xA => { if (buf_len < buf.len) { buf[buf_len] = '.'; buf_len += 1; } },
+                        0xB => { if (buf_len < buf.len) { buf[buf_len] = 'E'; buf_len += 1; } },
+                        0xC => {
+                            if (buf_len + 2 <= buf.len) {
+                                buf[buf_len] = 'E'; buf[buf_len + 1] = '-'; buf_len += 2;
+                            }
+                        },
+                        0xE => { if (buf_len < buf.len) { buf[buf_len] = '-'; buf_len += 1; } },
+                        0xF => break :outer,
+                        else => {},
+                    }
+                }
+            }
+            const f = std.fmt.parseFloat(f64, buf[0..buf_len]) catch 0.0;
+            if (std.math.isNan(f) or std.math.isInf(f)) return 0;
+            return @intFromFloat(@round(f));
         }
         return 0;
     }
 };
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+test "DictParser decodes CFF real number nibbles" {
+    // Encode 3.14: nibbles 3, A('.'), 1, 4, F(end)
+    // Packed: (3,A)=0x3A, (1,4)=0x14, (F,0)=0xF0
+    // b0 = 0x1E (30 decimal) signals real number
+    var p = DictParser{ .data = &[_]u8{ 0x1E, 0x3A, 0x14, 0xF0 }, .pos = 0 };
+    const n = try p.readNumber();
+    try std.testing.expectEqual(@as(i32, 3), n); // round(3.14) = 3
+}
+
+test "DictParser decodes negative CFF real number" {
+    // Encode -1.5: nibbles E('-'), 1, A('.'), 5, F(end)
+    // Packed: (E,1)=0xE1, (A,5)=0xA5, (F,0)=0xF0
+    var p = DictParser{ .data = &[_]u8{ 0x1E, 0xE1, 0xA5, 0xF0 }, .pos = 0 };
+    const n = try p.readNumber();
+    try std.testing.expectEqual(@as(i32, -2), n); // round(-1.5) = -2 (away from zero)
+}
+
+test "CFF ISOAdobe charset is identity mapping" {
+    // Construct a minimal CffParser state that triggers the ISOAdobe path:
+    // charset_offset == 0 with 10 charstrings.
+    var parser = CffParser{
+        .data = &[_]u8{},
+        .allocator = std.testing.allocator,
+        .charset_offset = 0,
+        .charstrings_index = .{
+            .count = 10,
+            .off_size = 1,
+            .offsets_offset = 0,
+            .data_offset = 0,
+        },
+    };
+    try parser.parseCharset();
+    defer parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), parser.charsets.len);
+    // Identity mapping: charsets[gid] == gid for all populated GIDs
+    for (0..10) |i| {
+        try std.testing.expectEqual(@as(u16, @intCast(i)), parser.charsets[i]);
+    }
+    // GID 0 → SID 0 → ".notdef" via standard CFF string table
+    try std.testing.expectEqualStrings(".notdef", parser.getGlyphName(0).?);
+    // GID 1 → SID 1 → "space"
+    try std.testing.expectEqualStrings("space", parser.getGlyphName(1).?);
+}

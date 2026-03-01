@@ -339,7 +339,7 @@ pub const Document = struct {
 
         for (fonts_dict.entries) |entry| {
             // Create cache key for page:name lookup
-            var key_buf: [64]u8 = undefined;
+            var key_buf: [256]u8 = undefined;
             const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_idx, entry.key }) catch continue;
 
             // Skip if already cached for this page
@@ -710,7 +710,14 @@ pub const Document = struct {
                 }
 
                 if (result.items.len > 0) {
-                    return result.toOwnedSlice(allocator);
+                    const structured = try result.toOwnedSlice(allocator);
+                    const stream_text = self.extractTextStreamOrder(page_num, allocator) catch return structured;
+                    defer allocator.free(stream_text);
+                    // If structured covers ≥60% of stream content, trust the structure tree order
+                    if (structured.len >= stream_text.len * 6 / 10) return structured;
+                    // Otherwise fall back to stream order (more complete for partially-tagged PDFs)
+                    allocator.free(structured);
+                    return try allocator.dupe(u8, stream_text);
                 }
                 result.deinit(allocator);
             }
@@ -1021,7 +1028,7 @@ fn pushOperand(operands: []interpreter.Operand, count: *usize, token: interprete
 /// Look up a font encoding in the cache by page number and font name.
 fn lookupFont(
     font_cache: *const std.StringHashMap(encoding.FontEncoding),
-    key_buf: *[64]u8,
+    key_buf: *[256]u8,
     page_num: usize,
     font_name: []const u8,
 ) ?*const encoding.FontEncoding {
@@ -1067,7 +1074,7 @@ fn extractContentStream(
     writer: anytype,
 ) !void {
     var lexer = interpreter.ContentLexer.init(allocator, content);
-    var operands: [64]interpreter.Operand = undefined;
+    var operands: [128]interpreter.Operand = undefined;
     var operand_count: usize = 0;
 
     var current_font: ?*const encoding.FontEncoding = null;
@@ -1076,8 +1083,13 @@ fn extractContentStream(
     var current_x: f64 = 0;
     var current_y: f64 = 0;
     var font_size: f64 = 12;
+    // Track the font size of the last shown text for newline threshold.
+    // Superscripts/subscripts switch to a smaller Tf *before* their Tm, so
+    // using raw font_size would make the threshold too small and produce
+    // spurious newlines for every super/subscript.
+    var last_text_font_size: f64 = 12;
 
-    var key_buf: [64]u8 = undefined;
+    var key_buf: [256]u8 = undefined;
 
     // Text buffer for structured mode (MCID tracking).
     // Spans longer than MCID_TEXT_BUF_SIZE bytes are silently truncated.
@@ -1141,7 +1153,11 @@ fn extractContentStream(
                         .stream => {
                             const wmode = if (current_font) |f| f.wmode else 0;
                             const displacement = if (wmode == 1) operands[0].number else operands[1].number;
-                            if (@abs(displacement) > font_size * 0.5 and prev_y != 0) {
+                            // Use max(font_size, last_text_font_size) so that a small
+                            // superscript font doesn't shrink the line-break threshold
+                            // below the displacement used for super/subscript positioning.
+                            const ref_size = @max(font_size, last_text_font_size);
+                            if (@abs(displacement) > ref_size * 0.7 and prev_y != 0) {
                                 try writer.writeByte('\n');
                             }
                             prev_y = operands[1].number;
@@ -1161,7 +1177,8 @@ fn extractContentStream(
                             const wmode = if (current_font) |f| f.wmode else 0;
                             const new_pos = if (wmode == 1) operands[4].number else operands[5].number;
                             const prev_pos = if (wmode == 1) prev_x else prev_y;
-                            if (@abs(new_pos - prev_pos) > font_size * 0.5 and prev_pos != 0) {
+                            const ref_size = @max(font_size, last_text_font_size);
+                            if (@abs(new_pos - prev_pos) > ref_size * 0.7 and prev_pos != 0) {
                                 try writer.writeByte('\n');
                             }
                             prev_x = operands[4].number;
@@ -1183,7 +1200,10 @@ fn extractContentStream(
                 },
                 'j' => if (operand_count >= 1) {
                     switch (mode) {
-                        .stream => try writeTextWithFont(operands[0], current_font, writer),
+                        .stream => {
+                            try writeTextWithFont(operands[0], current_font, writer);
+                            last_text_font_size = font_size;
+                        },
                         .bounds => |collector| try writeTextWithFont(operands[0], current_font, collector),
                         .structured => |extractor| {
                             text_pos = 0;
@@ -1194,7 +1214,10 @@ fn extractContentStream(
                 },
                 'J' => if (operand_count >= 1) {
                     switch (mode) {
-                        .stream => try writeTJArrayWithFont(operands[0], current_font, writer),
+                        .stream => {
+                            try writeTJArrayWithFont(operands[0], current_font, writer);
+                            last_text_font_size = font_size;
+                        },
                         .bounds => |collector| try writeTJArrayToCollector(operands[0], current_font, collector),
                         .structured => |extractor| {
                             text_pos = 0;
@@ -1210,6 +1233,7 @@ fn extractContentStream(
                     .stream => {
                         try writer.writeByte('\n');
                         try writeTextWithFont(operands[0], current_font, writer);
+                        last_text_font_size = font_size;
                     },
                     .bounds => |collector| {
                         try collector.flush();
@@ -1227,6 +1251,7 @@ fn extractContentStream(
                     .stream => {
                         try writer.writeByte('\n');
                         try writeTextWithFont(operands[2], current_font, writer);
+                        last_text_font_size = font_size;
                     },
                     .bounds => |collector| {
                         try collector.flush();
@@ -1318,7 +1343,10 @@ fn handleDoOperator(
     extractContentStream(form_content, .{ .stream = .{
         .resources = form_resources,
         .ctx = &child_ctx,
-    } }, ctx.font_cache, ctx.page_num, ctx.scratch_allocator, writer) catch {};
+    } }, ctx.font_cache, ctx.page_num, ctx.scratch_allocator, writer) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        // Domain errors (corrupt/unsupported stream): skip silently
+    };
 }
 
 fn writeTextWithFont(operand: interpreter.Operand, font: ?*const encoding.FontEncoding, writer: anytype) !void {
