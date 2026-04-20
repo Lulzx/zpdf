@@ -9,13 +9,11 @@ const zpdf = @import("root.zig");
 const WARMUP_RUNS = 2;
 const BENCH_RUNS = 5;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         std.debug.print(
@@ -49,12 +47,12 @@ pub fn main() !void {
     , .{pdf_path});
 
     // Get file size
-    const file = std.fs.cwd().openFile(pdf_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(io, pdf_path, .{}) catch |err| {
         std.debug.print("Error opening file: {}\n", .{err});
         return;
     };
-    const file_size = (try file.stat()).size;
-    file.close();
+    const file_size = (try file.stat(io)).size;
+    file.close(io);
 
     std.debug.print("Size: {d:.2} MB\n\n", .{@as(f64, @floatFromInt(file_size)) / (1024 * 1024)});
 
@@ -65,7 +63,7 @@ pub fn main() !void {
     var page_count: usize = 0;
 
     for (&times) |*t| {
-        const start = std.time.nanoTimestamp();
+        const start = std.Io.Clock.awake.now(io).nanoseconds;
 
         const doc = zpdf.Document.open(allocator, pdf_path) catch |err| {
             std.debug.print("ZPDF error: {}\n", .{err});
@@ -80,7 +78,7 @@ pub fn main() !void {
 
         doc.close();
 
-        const end = std.time.nanoTimestamp();
+        const end = std.Io.Clock.awake.now(io).nanoseconds;
         t.* = end - start;
     }
 
@@ -95,7 +93,7 @@ pub fn main() !void {
     if (!skip_mutool) {
         std.debug.print("\n── MuPDF Comparison ───────────────────────────────────────────\n", .{});
 
-        if (benchMutool(allocator, pdf_path)) |mutool_ns| {
+        if (benchMutool(allocator, io, pdf_path)) |mutool_ns| {
             std.debug.print("MuPDF:     {d:>8.2} ms\n", .{mutool_ns / 1e6});
             std.debug.print("Speedup:   {d:>8.2}x\n", .{mutool_ns / stats.mean});
         } else |_| {
@@ -130,14 +128,15 @@ const CharCounter = struct {
     }
 };
 
-fn benchMutool(allocator: std.mem.Allocator, pdf_path: []const u8) !f64 {
-    const start = std.time.nanoTimestamp();
+fn benchMutool(allocator: std.mem.Allocator, io: std.Io, pdf_path: []const u8) !f64 {
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
 
-    var child = std.process.Child.init(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
-    child.stderr_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path },
+        .stderr = .ignore,
+        .stdout = .ignore,
+    });
+    _ = try child.wait(io);
 
-    _ = try child.spawnAndWait();
-
-    return @floatFromInt(std.time.nanoTimestamp() - start);
+    return @floatFromInt(std.Io.Clock.awake.now(io).nanoseconds - start);
 }
