@@ -83,18 +83,24 @@ pub fn parseXRef(hash_allocator: std.mem.Allocator, parse_allocator: std.mem.All
 
         if (std.mem.startsWith(u8, xref_start, "xref")) {
             // Traditional xref table
-            const trailer = try parseXrefTable(parse_allocator, data, offset, &xref);
+            const trailer = parseXrefTable(parse_allocator, data, offset, &xref) catch |err| {
+                if (xref.entries.count() > 0) break;
+                return err;
+            };
             if (xref.trailer.entries.len == 0) {
                 xref.trailer = trailer;
             }
-            current_offset = getTrailerPrev(trailer);
+            current_offset = if (getTrailerPrev(trailer)) |prev| resolvePrevOffset(data, prev) else null;
         } else {
             // XRef stream (starts with object definition like "10 0 obj")
-            const trailer = try parseXrefStream(parse_allocator, data, offset, &xref);
+            const trailer = parseXrefStream(parse_allocator, data, offset, &xref) catch |err| {
+                if (xref.entries.count() > 0) break;
+                return err;
+            };
             if (xref.trailer.entries.len == 0) {
                 xref.trailer = trailer;
             }
-            current_offset = getTrailerPrev(trailer);
+            current_offset = if (getTrailerPrev(trailer)) |prev| resolvePrevOffset(data, prev) else null;
         }
     }
 
@@ -378,6 +384,26 @@ fn getTrailerPrev(trailer: Object.Dict) ?u64 {
     const prev = trailer.getInt("Prev") orelse return null;
     if (prev < 0) return null;
     return @intCast(prev);
+}
+
+fn resolvePrevOffset(data: []const u8, prev: u64) u64 {
+    if (prev >= data.len) return prev;
+    const start = @as(usize, @intCast(prev));
+    const tail = data[start..@min(data.len, start + 512)];
+    if (std.mem.startsWith(u8, tail, "trailer")) {
+        if (simd.findSubstring(tail, "startxref")) |rel_pos| {
+            var pos = rel_pos + 9;
+            while (pos < tail.len and isWhitespace(tail[pos])) : (pos += 1) {}
+            var offset: u64 = 0;
+            var found = false;
+            while (pos < tail.len and tail[pos] >= '0' and tail[pos] <= '9') : (pos += 1) {
+                offset = offset * 10 + (tail[pos] - '0');
+                found = true;
+            }
+            if (found) return offset;
+        }
+    }
+    return prev;
 }
 
 fn parseUint(data: []const u8, pos: *usize) ?u64 {

@@ -43,6 +43,29 @@ pub const MarkdownOptions = markdown.MarkdownOptions;
 pub const MarkdownRenderer = markdown.MarkdownRenderer;
 pub const FullTextMode = enum { accuracy, fast };
 
+const ArrayListWriter = struct {
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+
+    fn init(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) ArrayListWriter {
+        return .{ .buf = buf, .allocator = allocator };
+    }
+
+    pub fn writeByte(self: *ArrayListWriter, byte: u8) !void {
+        try self.buf.append(self.allocator, byte);
+    }
+
+    pub fn writeAll(self: *ArrayListWriter, bytes: []const u8) !void {
+        try self.buf.appendSlice(self.allocator, bytes);
+    }
+
+    pub fn print(self: *ArrayListWriter, comptime fmt: []const u8, args: anytype) !void {
+        const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(msg);
+        try self.writeAll(msg);
+    }
+};
+
 /// Error handling configuration
 pub const ErrorConfig = struct {
     /// Maximum errors before aborting
@@ -148,18 +171,17 @@ pub const Document = struct {
             @compileError("File I/O is not available on WASM. Use openFromMemory instead.");
         }
 
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
 
-        const stat = try file.stat(io);
-        const size = @as(usize, @intCast(stat.size));
+        const stat = try file.stat();
+        const size = stat.size;
 
         if (comptime is_windows) {
             // Windows: read file into allocated memory (no mmap support)
             const data = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), size);
             errdefer allocator.free(data);
-            const bytes_read = try std.Io.File.readPositionalAll(file, io, data, 0);
+            const bytes_read = try file.readAll(data);
             if (bytes_read != size) {
                 return error.UnexpectedEof;
             }
@@ -169,7 +191,7 @@ pub const Document = struct {
             const data = try std.posix.mmap(
                 null,
                 size,
-                std.posix.PROT{ .READ = true },
+                std.posix.PROT.READ,
                 .{ .TYPE = .PRIVATE },
                 file.handle,
                 0,
@@ -326,93 +348,86 @@ pub const Document = struct {
     fn ensurePageFonts(self: *Document, page_idx: usize) void {
         const arena = self.parsing_arena.allocator();
         const page = self.pages.items[page_idx];
-        if (page.resources == null) return;
-        const resources = page.resources.?;
-        const fonts_dict_obj = resources.get("Font") orelse return;
+        ensureResourceFonts(arena, self.data, &self.xref_table, &self.object_cache, &self.font_cache, &self.font_obj_cache, page.resources, page_idx);
+    }
 
-        const fonts_dict_resolved = switch (fonts_dict_obj) {
-            .reference => |ref| pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch null,
-            else => fonts_dict_obj,
-        };
-
-        if (fonts_dict_resolved == null or fonts_dict_resolved.? != .dict) return;
-
-        const fonts_dict = fonts_dict_resolved.?.dict;
-
-        for (fonts_dict.entries) |entry| {
-            // Create cache key for page:name lookup
-            var key_buf: [256]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_idx, entry.key }) catch continue;
-
-            // Skip if already cached for this page
-            if (self.font_cache.contains(key)) continue;
-
-            // Check if font value is a reference - we can reuse by object ID
-            const font_obj_id: ?u32 = switch (entry.value) {
-                .reference => |ref| ref.num,
+fn resolveDictObject(
+    arena: std.mem.Allocator,
+    data: []const u8,
+    xref_table: *const xref.XRefTable,
+    object_cache: *std.AutoHashMap(u32, parser.Object),
+    obj: parser.Object,
+) ?Object.Dict {
+    return switch (obj) {
+        .dict => |d| d,
+        .reference => |ref| blk: {
+            const resolved = pagetree.resolveRef(arena, data, xref_table, ref, object_cache) catch return null;
+            break :blk switch (resolved) {
+                .dict => |d| d,
                 else => null,
             };
+        },
+        else => null,
+    };
+}
 
-            // If we've already parsed this object ID, reuse the encoding
-            if (font_obj_id) |obj_id| {
-                if (self.font_obj_cache.get(obj_id)) |cached_enc| {
-                    // Reuse existing encoding - just add new key mapping
-                    const owned_key = arena.dupe(u8, key) catch continue;
-                    self.font_cache.put(owned_key, cached_enc) catch {};
-                    continue;
-                }
-            }
+fn ensureResourceFonts(
+    arena: std.mem.Allocator,
+    data: []const u8,
+    xref_table: *const xref.XRefTable,
+    object_cache: *std.AutoHashMap(u32, parser.Object),
+    font_cache: *std.StringHashMap(encoding.FontEncoding),
+    font_obj_cache: *std.AutoHashMap(u32, encoding.FontEncoding),
+    resource_dict: ?Object.Dict,
+    page_idx: usize,
+) void {
+    _ = font_obj_cache;
+    const resources = resource_dict orelse return;
+    const fonts_dict = resolveDictObject(arena, data, xref_table, object_cache, resources.get("Font") orelse return) orelse return;
 
-            // Resolve font dictionary
-            const font_obj = switch (entry.value) {
-                .reference => |ref| pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch continue,
-                .dict => entry.value,
-                else => continue,
+    const Resolver = struct {
+        arena: std.mem.Allocator,
+        data: []const u8,
+        xref_table: *const xref.XRefTable,
+        object_cache: *std.AutoHashMap(u32, parser.Object),
+
+        fn resolve(self_resolver: @This(), obj: parser.Object) parser.Object {
+            return switch (obj) {
+                .reference => |ref| resolveLatestRef(self_resolver.arena, self_resolver.data, self_resolver.xref_table, ref, self_resolver.object_cache) catch obj,
+                else => obj,
             };
-
-            const fd = switch (font_obj) {
-                .dict => |d| d,
-                else => continue,
-            };
-
-            const Resolver = struct {
-                arena: std.mem.Allocator,
-                data: []const u8,
-                xref_table: *const xref.XRefTable,
-                object_cache: *std.AutoHashMap(u32, parser.Object),
-
-                fn resolve(self_resolver: @This(), obj: parser.Object) parser.Object {
-                    return switch (obj) {
-                        .reference => |ref| pagetree.resolveRef(self_resolver.arena, self_resolver.data, self_resolver.xref_table, ref, self_resolver.object_cache) catch obj,
-                        else => obj,
-                    };
-                }
-            };
-            const resolver = Resolver{
-                .arena = arena,
-                .data = self.data,
-                .xref_table = &self.xref_table,
-                .object_cache = &self.object_cache,
-            };
-
-            // Use the comprehensive parseFontEncoding
-            const enc = encoding.parseFontEncoding(arena, fd, struct {
-                fn wrapper(ctx: *const anyopaque, obj: parser.Object) parser.Object {
-                    const r: *const Resolver = @ptrCast(@alignCast(ctx));
-                    return r.resolve(obj);
-                }
-            }.wrapper, &resolver) catch continue;
-
-            // Need to dupe key since bufPrint uses stack buffer
-            const owned_key = arena.dupe(u8, key) catch continue;
-            self.font_cache.put(owned_key, enc) catch {};
-
-            // Cache by object ID for reuse across pages
-            if (font_obj_id) |obj_id| {
-                self.font_obj_cache.put(obj_id, enc) catch {};
-            }
         }
+    };
+    const resolver = Resolver{
+        .arena = arena,
+        .data = data,
+        .xref_table = xref_table,
+        .object_cache = object_cache,
+    };
+
+    for (fonts_dict.entries) |entry| {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ page_idx, entry.key }) catch continue;
+        if (font_cache.contains(key)) continue;
+
+        const font_obj_id: ?u32 = switch (entry.value) {
+            .reference => |ref| ref.num,
+            else => null,
+        };
+
+        const fd = resolveDictObject(arena, data, xref_table, object_cache, entry.value) orelse continue;
+        const enc = encoding.parseFontEncoding(arena, fd, struct {
+            fn wrapper(ctx: *const anyopaque, obj: parser.Object) parser.Object {
+                const r: *const Resolver = @ptrCast(@alignCast(ctx));
+                return r.resolve(obj);
+            }
+        }.wrapper, &resolver) catch continue;
+
+        const owned_key = arena.dupe(u8, key) catch continue;
+        font_cache.put(owned_key, enc) catch {};
+        _ = font_obj_id;
     }
+}
 
     /// Close the document and free resources
     pub fn close(self: *Document) void {
@@ -525,6 +540,7 @@ pub const Document = struct {
             .xref_table = &self.xref_table,
             .object_cache = &self.object_cache,
             .font_cache = &self.font_cache,
+            .font_obj_cache = &self.font_obj_cache,
             .page_num = page_num,
             .depth = 0,
         };
@@ -779,10 +795,9 @@ pub const Document = struct {
         const content = pagetree.getPageContents(parse_allocator, scratch_allocator, self.data, &self.xref_table, page, &self.object_cache) catch return output.toOwnedSlice(allocator);
 
         self.ensurePageFonts(page_num);
-        var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &output);
-        errdefer aw.deinit();
-        try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, &aw.writer);
-        return aw.toOwnedSlice();
+        var writer = ArrayListWriter.init(&output, allocator);
+        try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, &writer);
+        return output.toOwnedSlice(allocator);
     }
 
     /// Extract text from all pages using structure tree order
@@ -866,9 +881,8 @@ pub const Document = struct {
 
                 if (content.len == 0) continue;
                 self.ensurePageFonts(page_num);
-                var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &result);
-                try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, &aw.writer);
-                result = aw.toArrayList();
+                var writer = ArrayListWriter.init(&result, allocator);
+                try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, &writer);
             }
         }
 
@@ -1122,7 +1136,8 @@ pub const Document = struct {
             if (s.len > 0) switch (s[0]) {
                 'D' => {
                     // Decimal
-                    buf.print(allocator, "{}", .{page_number}) catch return null;
+                    var writer = ArrayListWriter.init(&buf, allocator);
+                    writer.print("{}", .{page_number}) catch return null;
                 },
                 'r' => {
                     // Lowercase roman
@@ -1141,7 +1156,8 @@ pub const Document = struct {
                     formatAlpha(&buf, allocator, page_number, true) catch return null;
                 },
                 else => {
-                    buf.print(allocator, "{}", .{page_number}) catch return null;
+                    var writer = ArrayListWriter.init(&buf, allocator);
+                    writer.print("{}", .{page_number}) catch return null;
                 },
             };
         }
@@ -1149,7 +1165,8 @@ pub const Document = struct {
         if (buf.items.len == 0) {
             // No style, just return prefix or page number
             if (prefix == null) {
-                buf.print(allocator, "{}", .{page_idx + 1}) catch return null;
+                var writer = ArrayListWriter.init(&buf, allocator);
+                writer.print("{}", .{page_idx + 1}) catch return null;
             }
         }
 
@@ -1158,7 +1175,8 @@ pub const Document = struct {
 
     fn formatRoman(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, upper: bool) !void {
         if (number == 0 or number > 3999) {
-            try buf.print(allocator, "{}", .{number});
+            var writer = ArrayListWriter.init(buf, allocator);
+            try writer.print("{}", .{number});
             return;
         }
         const values = [_]struct { v: u16, s_upper: []const u8, s_lower: []const u8 }{
@@ -1187,7 +1205,8 @@ pub const Document = struct {
 
     fn formatAlpha(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, upper: bool) !void {
         if (number == 0) {
-            try buf.print(allocator, "{}", .{number});
+            var writer = ArrayListWriter.init(buf, allocator);
+            try writer.print("{}", .{number});
             return;
         }
         // a=1, b=2, ..., z=26, aa=27, ab=28, ...
@@ -1882,6 +1901,7 @@ const ExtractionContext = struct {
     xref_table: *const XRefTable,
     object_cache: *std.AutoHashMap(u32, Object),
     font_cache: *const std.StringHashMap(encoding.FontEncoding),
+    font_obj_cache: *std.AutoHashMap(u32, encoding.FontEncoding),
     page_num: usize,
     depth: u8, // Recursion depth for nested Form XObjects
 
@@ -1951,6 +1971,34 @@ fn lookupFont(
     return font_cache.getPtr(key);
 }
 
+fn resolveLatestRef(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    xref_table: *const xref.XRefTable,
+    ref: ObjRef,
+    object_cache: *std.AutoHashMap(u32, parser.Object),
+) !Object {
+    const base = try pagetree.resolveRef(allocator, data, xref_table, ref, object_cache);
+
+    var pattern_buf: [32]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&pattern_buf, "{d} {d} obj", .{ ref.num, ref.gen }) catch return base;
+
+    const base_entry = xref_table.get(ref.num) orelse return base;
+    var latest_offset: usize = @intCast(base_entry.offset);
+    var search_from = latest_offset + 1;
+    while (search_from < data.len) {
+        const rel = std.mem.indexOf(u8, data[search_from..], pattern) orelse break;
+        latest_offset = search_from + rel;
+        search_from = latest_offset + pattern.len;
+    }
+
+    if (latest_offset == @as(usize, @intCast(base_entry.offset))) return base;
+
+    var p = parser.Parser.initAt(allocator, data, latest_offset);
+    const indirect = p.parseIndirectObject() catch return base;
+    return indirect.obj;
+}
+
 /// Extract text from content stream using pre-resolved fonts
 fn extractTextFromContent(
     allocator: std.mem.Allocator,
@@ -2003,7 +2051,6 @@ fn extractContentStream(
     // using raw font_size would make the threshold too small and produce
     // spurious newlines for every super/subscript.
     var last_text_font_size: f64 = 12;
-
     var key_buf: [256]u8 = undefined;
 
     // Text buffer for structured mode (MCID tracking).
@@ -2241,7 +2288,24 @@ fn handleDoOperator(
     defer ctx.scratch_allocator.free(form_content);
 
     // Get Form XObject's own resources (may inherit from parent)
-    const form_resources = xobj_resolved.dict.getDict("Resources") orelse resources;
+    const form_resources = Document.resolveDictObject(
+        ctx.parse_allocator,
+        ctx.data,
+        ctx.xref_table,
+        @constCast(ctx.object_cache),
+        xobj_resolved.dict.get("Resources") orelse Object{ .null = {} },
+    ) orelse resources;
+
+    Document.ensureResourceFonts(
+        ctx.parse_allocator,
+        ctx.data,
+        ctx.xref_table,
+        @constCast(ctx.object_cache),
+        @constCast(ctx.font_cache),
+        ctx.font_obj_cache,
+        form_resources,
+        ctx.page_num,
+    );
 
     // Recursively extract text with increased depth
     const child_ctx = ExtractionContext{
@@ -2251,6 +2315,7 @@ fn handleDoOperator(
         .xref_table = ctx.xref_table,
         .object_cache = ctx.object_cache,
         .font_cache = ctx.font_cache,
+        .font_obj_cache = ctx.font_obj_cache,
         .page_num = ctx.page_num,
         .depth = ctx.depth + 1,
     };
@@ -2479,10 +2544,13 @@ pub fn extractTextFromFile(allocator: std.mem.Allocator, path: []const u8) ![]u8
     const doc = try Document.open(allocator, path);
     defer doc.close();
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    try doc.extractAllText(&aw.writer);
-    return aw.toOwnedSlice();
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var writer = ArrayListWriter.init(&output, allocator);
+    try doc.extractAllText(&writer);
+
+    return output.toOwnedSlice(allocator);
 }
 
 /// Extract text from a PDF in memory to a string
@@ -2490,10 +2558,13 @@ pub fn extractTextFromMemory(allocator: std.mem.Allocator, data: []const u8) ![]
     const doc = try Document.openFromMemory(allocator, data, ErrorConfig.default());
     defer doc.close();
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    try doc.extractAllText(&aw.writer);
-    return aw.toOwnedSlice();
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var writer = ArrayListWriter.init(&output, allocator);
+    try doc.extractAllText(&writer);
+
+    return output.toOwnedSlice(allocator);
 }
 
 // ============================================================================
