@@ -92,8 +92,9 @@ fn mainInner(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (benchMutool(allocator, pdf_path)) |mutool_ns| {
             std.debug.print("MuPDF:     {d:>8.2} ms\n", .{mutool_ns / 1e6});
             std.debug.print("Speedup:   {d:>8.2}x\n", .{mutool_ns / stats.mean});
-        } else |_| {
-            std.debug.print("(mutool not found)\n", .{});
+        } else |err| switch (err) {
+            error.MutoolFailed => std.debug.print("(mutool failed)\n", .{}),
+            else => std.debug.print("(mutool not found)\n", .{}),
         }
     }
 }
