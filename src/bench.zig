@@ -92,8 +92,9 @@ fn mainInner(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (benchMutool(allocator, pdf_path)) |mutool_ns| {
             std.debug.print("MuPDF:     {d:>8.2} ms\n", .{mutool_ns / 1e6});
             std.debug.print("Speedup:   {d:>8.2}x\n", .{mutool_ns / stats.mean});
-        } else |_| {
-            std.debug.print("(mutool not found)\n", .{});
+        } else |err| switch (err) {
+            error.MutoolFailed => std.debug.print("(mutool failed)\n", .{}),
+            else => std.debug.print("(mutool not found)\n", .{}),
         }
     }
 }
@@ -127,7 +128,8 @@ const CharCounter = struct {
 fn benchMutool(allocator: std.mem.Allocator, pdf_path: []const u8) !f64 {
     const start = compat.nanoTimestamp();
 
-    _ = try compat.runIgnored(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
+    const exit_code = try compat.runIgnored(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
+    if (exit_code != 0) return error.MutoolFailed;
 
     return @floatFromInt(compat.nanoTimestamp() - start);
 }
