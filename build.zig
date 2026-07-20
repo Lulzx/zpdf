@@ -136,6 +136,16 @@ pub fn build(b: *std.Build) void {
 
     const run_encoding_unit_tests = b.addRunArtifact(encoding_unit_tests);
 
+    const compat_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compat.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_compat_unit_tests = b.addRunArtifact(compat_unit_tests);
+
     const interpreter_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/interpreter.zig"),
@@ -173,6 +183,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parser_unit_tests.step);
     test_step.dependOn(&run_xref_unit_tests.step);
     test_step.dependOn(&run_encoding_unit_tests.step);
+    test_step.dependOn(&run_compat_unit_tests.step);
     test_step.dependOn(&run_interpreter_unit_tests.step);
     test_step.dependOn(&run_testpdf_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);

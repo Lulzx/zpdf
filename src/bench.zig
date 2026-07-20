@@ -4,19 +4,15 @@
 //! Run with: zig build bench -- path/to/test.pdf
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const zpdf = @import("root.zig");
 
 const WARMUP_RUNS = 2;
 const BENCH_RUNS = 5;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub const main = compat.MainWithArgs(mainInner).main;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+fn mainInner(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) {
         std.debug.print(
             \\ZPDF Benchmark Suite
@@ -48,13 +44,11 @@ pub fn main() !void {
         \\
     , .{pdf_path});
 
-    // Get file size
-    const file = std.fs.cwd().openFile(pdf_path, .{}) catch |err| {
+    // Get file size.
+    const file_size = compat.fileSizeCwd(pdf_path) catch |err| {
         std.debug.print("Error opening file: {}\n", .{err});
         return;
     };
-    const file_size = (try file.stat()).size;
-    file.close();
 
     std.debug.print("Size: {d:.2} MB\n\n", .{@as(f64, @floatFromInt(file_size)) / (1024 * 1024)});
 
@@ -65,7 +59,7 @@ pub fn main() !void {
     var page_count: usize = 0;
 
     for (&times) |*t| {
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         const doc = zpdf.Document.open(allocator, pdf_path) catch |err| {
             std.debug.print("ZPDF error: {}\n", .{err});
@@ -80,7 +74,7 @@ pub fn main() !void {
 
         doc.close();
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
         t.* = end - start;
     }
 
@@ -131,13 +125,9 @@ const CharCounter = struct {
 };
 
 fn benchMutool(allocator: std.mem.Allocator, pdf_path: []const u8) !f64 {
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
 
-    var child = std.process.Child.init(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
-    child.stderr_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
+    _ = try compat.runIgnored(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
 
-    _ = try child.spawnAndWait();
-
-    return @floatFromInt(std.time.nanoTimestamp() - start);
+    return @floatFromInt(compat.nanoTimestamp() - start);
 }

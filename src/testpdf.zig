@@ -4,13 +4,14 @@
 //! These are hand-crafted PDFs that exercise specific features.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 /// Generate a minimal PDF with plain text
 pub fn generateMinimalPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
 
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     // Header
     try writer.writeAll("%PDF-1.4\n");
@@ -41,7 +42,7 @@ pub fn generateMinimalPdf(allocator: std.mem.Allocator, text: []const u8) ![]u8 
     // Build content stream
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(allocator);
-    var cw = content.writer(allocator);
+    var cw = compat.arrayListWriter(&content, allocator);
 
     try cw.writeAll("BT\n");
     try cw.writeAll("/F1 12 Tf\n");
@@ -85,7 +86,7 @@ pub fn generateMultiPagePdf(allocator: std.mem.Allocator, pages_text: []const []
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
 
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
     var offsets: std.ArrayList(u64) = .empty;
     defer offsets.deinit(allocator);
 
@@ -130,7 +131,7 @@ pub fn generateMultiPagePdf(allocator: std.mem.Allocator, pages_text: []const []
         // Content stream
         var content: std.ArrayList(u8) = .empty;
         defer content.deinit(allocator);
-        var cw = content.writer(allocator);
+        var cw = compat.arrayListWriter(&content, allocator);
         try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n");
         try cw.print("({s}) Tj\n", .{text});
         try cw.writeAll("ET\n");
@@ -166,7 +167,7 @@ pub fn generateTJPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
 
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -205,7 +206,7 @@ pub fn generateCIDFontPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
 
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -298,7 +299,7 @@ pub fn generateCIDFontPdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generatePdfWithoutPageType(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -317,7 +318,7 @@ pub fn generatePdfWithoutPageType(allocator: std.mem.Allocator, text: []const u8
 
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(allocator);
-    var cw = content.writer(allocator);
+    var cw = compat.arrayListWriter(&content, allocator);
     try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n");
     try cw.print("({s}) Tj\n", .{text});
     try cw.writeAll("ET\n");
@@ -346,7 +347,7 @@ pub fn generatePdfWithoutPageType(allocator: std.mem.Allocator, text: []const u8
 pub fn generateInlineImagePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -393,7 +394,7 @@ pub fn generateInlineImagePdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateSuperscriptPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -487,7 +488,7 @@ pub fn generateIncrementalPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
 
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     // ===== ORIGINAL PDF =====
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
@@ -554,7 +555,7 @@ pub fn generateEncryptedPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
 
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -638,7 +639,7 @@ test "generate incremental PDF" {
 pub fn generateMetadataPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -686,7 +687,7 @@ pub fn generateMetadataPdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -756,7 +757,7 @@ pub fn generateOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateLinkPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -805,7 +806,7 @@ pub fn generateLinkPdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateFormFieldPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -860,7 +861,7 @@ pub fn generateFormFieldPdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generatePageLabelPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -961,7 +962,7 @@ test "generate page label PDF" {
 pub fn generateNestedOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -1038,7 +1039,7 @@ pub fn generateNestedOutlinePdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateMultiLinkPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -1098,7 +1099,7 @@ pub fn generateMultiLinkPdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateAllFormFieldsPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -1162,7 +1163,7 @@ pub fn generateAllFormFieldsPdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateExtendedPageLabelPdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -1198,7 +1199,7 @@ pub fn generateExtendedPageLabelPdf(allocator: std.mem.Allocator) ![]u8 {
 
         var content: std.ArrayList(u8) = .empty;
         defer content.deinit(allocator);
-        var cw = content.writer(allocator);
+        var cw = compat.arrayListWriter(&content, allocator);
         try cw.writeAll("BT\n/F1 12 Tf\n100 700 Td\n");
         try cw.print("({s}) Tj\n", .{page_texts[pg]});
         try cw.writeAll("ET\n");
@@ -1236,7 +1237,7 @@ pub fn generateExtendedPageLabelPdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateImagePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 
@@ -1290,7 +1291,7 @@ pub fn generateImagePdf(allocator: std.mem.Allocator) ![]u8 {
 pub fn generateUtf16BePdf(allocator: std.mem.Allocator) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(allocator);
-    var writer = pdf.writer(allocator);
+    var writer = compat.arrayListWriter(&pdf, allocator);
 
     try writer.writeAll("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
 

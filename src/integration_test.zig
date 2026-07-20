@@ -3,6 +3,7 @@
 //! Tests the full parsing and extraction pipeline using generated PDFs.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const zpdf = @import("root.zig");
 const testpdf = @import("testpdf.zig");
 
@@ -31,7 +32,7 @@ test "extract text from minimal PDF" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, compat.arrayListWriter(&output, allocator));
 
     // Should contain our test text
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Test123") != null);
@@ -63,7 +64,7 @@ test "extract all text from multi-page PDF" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractAllText(output.writer(allocator));
+    try doc.extractAllText(compat.arrayListWriter(&output, allocator));
 
     try std.testing.expect(std.mem.indexOf(u8, output.items, "PageA") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "PageB") != null);
@@ -81,7 +82,7 @@ test "parse TJ operator PDF" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, compat.arrayListWriter(&output, allocator));
 
     // TJ with spacing should produce "Hello World" (with space from -200 adjustment)
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Hello") != null);
@@ -258,7 +259,7 @@ test "extract text from incremental PDF - gets updated content" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
 
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, compat.arrayListWriter(&output, allocator));
 
     // Should extract "Updated Text" NOT "Original Text"
     // because incremental update replaced object 4
@@ -280,7 +281,7 @@ test "page tree tolerates leaf node without /Type" {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, compat.arrayListWriter(&output, allocator));
     try std.testing.expect(std.mem.indexOf(u8, output.items, "NoTypeTest") != null);
 }
 
@@ -295,7 +296,7 @@ test "inline image does not corrupt text extraction" {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, compat.arrayListWriter(&output, allocator));
 
     // Both text spans surrounding the inline image must be present (Fix 1: BI/EI skip)
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Before") != null);
@@ -987,7 +988,7 @@ test "superscript positioning does not insert spurious newline" {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    try doc.extractText(0, output.writer(allocator));
+    try doc.extractText(0, compat.arrayListWriter(&output, allocator));
 
     // All three text chunks must be present
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Hello") != null);

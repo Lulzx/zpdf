@@ -10,6 +10,7 @@
 //! 5. Explicit error budgets - caller controls tolerance
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
 
@@ -148,31 +149,15 @@ pub const Document = struct {
             @compileError("File I/O is not available on WASM. Use openFromMemory instead.");
         }
 
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-
-        const stat = try file.stat();
-        const size = stat.size;
-
         if (comptime is_windows) {
-            // Windows: read file into allocated memory (no mmap support)
-            const data = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), size);
-            errdefer allocator.free(data);
-            const bytes_read = try file.readAll(data);
-            if (bytes_read != size) {
-                return error.UnexpectedEof;
-            }
+            const data = try compat.readFileAllocAlignedCwd(
+                allocator,
+                path,
+                .fromByteUnits(std.heap.page_size_min),
+            );
             return openFromMemoryOwnedAlloc(allocator, data, config);
         } else {
-            // POSIX: memory map the file
-            const data = try std.posix.mmap(
-                null,
-                size,
-                std.posix.PROT.READ,
-                .{ .TYPE = .PRIVATE },
-                file.handle,
-                0,
-            );
+            const data = try compat.mmapFileReadOnlyCwd(allocator, path);
             return openFromMemoryOwned(allocator, data, config);
         }
     }
@@ -778,7 +763,7 @@ pub const Document = struct {
         const content = pagetree.getPageContents(parse_allocator, scratch_allocator, self.data, &self.xref_table, page, &self.object_cache) catch return output.toOwnedSlice(allocator);
 
         self.ensurePageFonts(page_num);
-        try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, output.writer(allocator));
+        try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, compat.arrayListWriter(&output, allocator));
         return output.toOwnedSlice(allocator);
     }
 
@@ -863,7 +848,7 @@ pub const Document = struct {
 
                 if (content.len == 0) continue;
                 self.ensurePageFonts(page_num);
-                try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, result.writer(allocator));
+                try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, compat.arrayListWriter(&result, allocator));
             }
         }
 
@@ -1117,7 +1102,7 @@ pub const Document = struct {
             if (s.len > 0) switch (s[0]) {
                 'D' => {
                     // Decimal
-                    buf.writer(allocator).print("{}", .{page_number}) catch return null;
+                    compat.arrayListWriter(&buf, allocator).print("{}", .{page_number}) catch return null;
                 },
                 'r' => {
                     // Lowercase roman
@@ -1136,7 +1121,7 @@ pub const Document = struct {
                     formatAlpha(&buf, allocator, page_number, true) catch return null;
                 },
                 else => {
-                    buf.writer(allocator).print("{}", .{page_number}) catch return null;
+                    compat.arrayListWriter(&buf, allocator).print("{}", .{page_number}) catch return null;
                 },
             };
         }
@@ -1144,7 +1129,7 @@ pub const Document = struct {
         if (buf.items.len == 0) {
             // No style, just return prefix or page number
             if (prefix == null) {
-                buf.writer(allocator).print("{}", .{page_idx + 1}) catch return null;
+                compat.arrayListWriter(&buf, allocator).print("{}", .{page_idx + 1}) catch return null;
             }
         }
 
@@ -1153,7 +1138,7 @@ pub const Document = struct {
 
     fn formatRoman(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, upper: bool) !void {
         if (number == 0 or number > 3999) {
-            try buf.writer(allocator).print("{}", .{number});
+            try compat.arrayListWriter(buf, allocator).print("{}", .{number});
             return;
         }
         const values = [_]struct { v: u16, s_upper: []const u8, s_lower: []const u8 }{
@@ -1182,7 +1167,7 @@ pub const Document = struct {
 
     fn formatAlpha(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, upper: bool) !void {
         if (number == 0) {
-            try buf.writer(allocator).print("{}", .{number});
+            try compat.arrayListWriter(buf, allocator).print("{}", .{number});
             return;
         }
         // a=1, b=2, ..., z=26, aa=27, ab=28, ...
@@ -2477,7 +2462,7 @@ pub fn extractTextFromFile(allocator: std.mem.Allocator, path: []const u8) ![]u8
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
-    try doc.extractAllText(output.writer(allocator));
+    try doc.extractAllText(compat.arrayListWriter(&output, allocator));
 
     return output.toOwnedSlice(allocator);
 }
@@ -2490,7 +2475,7 @@ pub fn extractTextFromMemory(allocator: std.mem.Allocator, data: []const u8) ![]
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
-    try doc.extractAllText(output.writer(allocator));
+    try doc.extractAllText(compat.arrayListWriter(&output, allocator));
 
     return output.toOwnedSlice(allocator);
 }

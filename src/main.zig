@@ -7,16 +7,12 @@
 //! Designed to be a drop-in comparison with `mutool draw -F txt`
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const zpdf = @import("root.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub const main = compat.MainWithArgs(mainInner).main;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+fn mainInner(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) {
         try printUsage();
         return;
@@ -42,7 +38,7 @@ pub fn main() !void {
 
 fn printUsage() !void {
     var buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = compat.stdoutWriter(&buf);
     const stdout = &bw.interface;
     defer stdout.flush() catch {};
     try stdout.writeAll(
@@ -162,13 +158,13 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Setup output
     const output_handle = if (output_file) |out_path|
-        std.fs.cwd().createFile(out_path, .{}) catch |err| {
+        compat.createFileCwd(out_path) catch |err| {
             std.debug.print("Error creating {s}: {}\n", .{ out_path, err });
             return;
         }
     else
         null;
-    defer if (output_handle) |h| h.close();
+    defer if (output_handle) |h| compat.closeFile(h);
 
     // Parse page range
     const pages = parsePageRange(allocator, page_range, doc.pages.items.len) catch |err| {
@@ -192,12 +188,12 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
         defer allocator.free(result);
 
         if (output_handle) |h| {
-            h.writeAll(result) catch |err| {
+            compat.writeAllFile(h, result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
                 return;
             };
         } else {
-            std.fs.File.stdout().writeAll(result) catch |err| {
+            compat.writeAllStdout(result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
                 return;
             };
@@ -211,23 +207,23 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
         defer allocator.free(result);
 
         if (output_handle) |h| {
-            h.writeAll(result) catch |err| {
+            compat.writeAllFile(h, result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
                 return;
             };
         } else {
-            std.fs.File.stdout().writeAll(result) catch |err| {
+            compat.writeAllStdout(result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
                 return;
             };
         }
     } else if (output_handle) |h| {
-        var file_writer = h.writer(&write_buf);
+        var file_writer = compat.fileWriter(h, &write_buf);
         const writer = &file_writer.interface;
         defer writer.flush() catch {};
         try doExtract(doc, pages, output_format, extraction_mode, allocator, writer);
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&write_buf);
+        var stdout_writer = compat.stdoutWriter(&write_buf);
         const writer = &stdout_writer.interface;
         defer writer.flush() catch {};
         try doExtract(doc, pages, output_format, extraction_mode, allocator, writer);
@@ -236,7 +232,7 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Report errors if any
     if (doc.errors.items.len > 0) {
         var stderr_buf: [4096]u8 = undefined;
-        var stderr_bw = std.fs.File.stderr().writer(&stderr_buf);
+        var stderr_bw = compat.stderrWriter(&stderr_buf);
         const stderr = &stderr_bw.interface;
         defer stderr.flush() catch {};
         try stderr.print("\nWarning: {} errors encountered during extraction\n", .{doc.errors.items.len});
@@ -384,7 +380,7 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
                             if (ii > 0) try writer.writeAll(",");
                             try writer.print("\n        {{\"rect\": [{d:.1}, {d:.1}, {d:.1}, {d:.1}], \"width\": {}, \"height\": {}}}", .{
                                 img.rect[0], img.rect[1], img.rect[2], img.rect[3],
-                                img.width, img.height,
+                                img.width,   img.height,
                             });
                         }
                         if (images.len > 0) try writer.writeAll("\n      ");
@@ -556,7 +552,7 @@ fn runInfo(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer doc.close();
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_bw = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_bw = compat.stdoutWriter(&stdout_buf);
     const stdout = &stdout_bw.interface;
     defer stdout.flush() catch {};
 
@@ -670,7 +666,7 @@ fn runSearch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer zpdf.Document.freeSearchResults(allocator, results);
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_bw = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_bw = compat.stdoutWriter(&stdout_buf);
     const stdout = &stdout_bw.interface;
     defer stdout.flush() catch {};
 
@@ -705,7 +701,7 @@ fn runBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const parallel = args.len > 1 and std.mem.eql(u8, args[1], "--parallel");
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_bw = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_bw = compat.stdoutWriter(&stdout_buf);
     const stdout = &stdout_bw.interface;
     defer stdout.flush() catch {};
 
@@ -716,7 +712,7 @@ fn runBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var page_count: usize = 0;
 
     for (&times) |*t| {
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         const doc = zpdf.Document.open(allocator, path) catch |err| {
             std.debug.print("Error opening {s}: {}\n", .{ path, err });
@@ -740,7 +736,7 @@ fn runBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         doc.close();
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
         t.* = @intCast(end - start);
     }
 
@@ -766,18 +762,14 @@ fn runBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Try to run mutool for comparison
     try stdout.writeAll("\nAttempting mutool comparison...\n");
 
-    var child = std.process.Child.init(&.{ "mutool", "convert", "-F", "text", "-o", "/dev/null", path }, allocator);
-    child.stderr_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-
-    const mutool_start = std.time.nanoTimestamp();
-    const term = child.spawnAndWait() catch {
+    const mutool_start = compat.nanoTimestamp();
+    const mutool_exit_code = compat.runIgnored(&.{ "mutool", "convert", "-F", "text", "-o", "/dev/null", path }, allocator) catch {
         try stdout.writeAll("  mutool not found or failed\n");
         return;
     };
-    const mutool_end = std.time.nanoTimestamp();
+    const mutool_end = compat.nanoTimestamp();
 
-    if (term.Exited == 0) {
+    if (mutool_exit_code == 0) {
         const mutool_ms = @as(f64, @floatFromInt(mutool_end - mutool_start)) / 1_000_000.0;
         try stdout.print("  MuPDF:  {d:.2} ms\n", .{mutool_ms});
         try stdout.print("  Speedup: {d:.2}x\n", .{mutool_ms / mean_ms});

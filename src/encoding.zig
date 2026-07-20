@@ -11,6 +11,7 @@
 //! CID fonts use CIDToGIDMap instead
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const parser = @import("parser.zig");
 const decompress = @import("decompress.zig");
 const cff = @import("cff.zig");
@@ -581,7 +582,7 @@ fn parseFontDescriptor(font_dict: Object.Dict, resolve_fn: *const fn (ctx: *cons
                         stream.dict.get("Filter"),
                         stream.dict.get("DecodeParms"),
                     ) catch null;
-                    
+
                     if (data) |d| {
                         encoding.cff_data = d;
                         if (cff.CffParser.init(encoding.allocator, d)) |parser_inst| {
@@ -1358,7 +1359,7 @@ test "WinAnsi decode ASCII" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
 
-    try enc.decode("Hello", output.writer(std.testing.allocator));
+    try enc.decode("Hello", compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("Hello", output.items);
 }
 
@@ -1370,7 +1371,7 @@ test "WinAnsi decode extended" {
     defer output.deinit(std.testing.allocator);
 
     // 0x93 = left double quote, 0x94 = right double quote
-    try enc.decode(&[_]u8{ 0x93, 'H', 'i', 0x94 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x93, 'H', 'i', 0x94 }, compat.arrayListWriter(&output, std.testing.allocator));
 
     // Should be "Hi" with smart quotes
     try std.testing.expectEqualStrings("\xe2\x80\x9cHi\xe2\x80\x9d", output.items);
@@ -1394,7 +1395,7 @@ test "CID font decode UTF-16BE" {
     defer output.deinit(std.testing.allocator);
 
     // UTF-16BE for "A" (0x0041)
-    try enc.decode(&[_]u8{ 0x00, 0x41 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x00, 0x41 }, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("A", output.items);
 }
 
@@ -1409,7 +1410,7 @@ test "CID font decode CJK character" {
     defer output.deinit(std.testing.allocator);
 
     // UTF-16BE for Chinese character "中" (U+4E2D)
-    try enc.decode(&[_]u8{ 0x4E, 0x2D }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x4E, 0x2D }, compat.arrayListWriter(&output, std.testing.allocator));
     // Should output UTF-8 encoding of U+4E2D = 0xE4 0xB8 0xAD
     try std.testing.expectEqualStrings("中", output.items);
 }
@@ -1435,7 +1436,7 @@ test "CID font with CMap ranges" {
     defer output.deinit(std.testing.allocator);
 
     // Character code 0x0002 should map to 'B'
-    try enc.decode(&[_]u8{ 0x00, 0x02 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x00, 0x02 }, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("B", output.items);
 }
 
@@ -1451,7 +1452,7 @@ test "CID font decode surrogate pairs" {
 
     // UTF-16BE surrogate pair for U+1F600 (😀)
     // High surrogate: 0xD83D, Low surrogate: 0xDE00
-    try enc.decode(&[_]u8{ 0xD8, 0x3D, 0xDE, 0x00 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0xD8, 0x3D, 0xDE, 0x00 }, compat.arrayListWriter(&output, std.testing.allocator));
     // Should output UTF-8 encoding of U+1F600 = 0xF0 0x9F 0x98 0x80
     try std.testing.expectEqualStrings("😀", output.items);
 }
@@ -1467,7 +1468,7 @@ test "MacRoman encoding" {
     defer output.deinit(std.testing.allocator);
 
     // 0xCA in MacRoman is a non-breaking space
-    try enc.decode(&[_]u8{0xCA}, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{0xCA}, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqual(@as(usize, 2), output.items.len); // UTF-8 NBSP is 2 bytes
 }
 
@@ -1481,7 +1482,7 @@ test "encoding differences array" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
 
-    try enc.decode(&[_]u8{65}, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{65}, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("B", output.items);
 }
 
@@ -1497,7 +1498,7 @@ test "CID identity mapping" {
     defer output.deinit(std.testing.allocator);
 
     // 0x0041 = 'A' in Unicode
-    try enc.decode(&[_]u8{ 0x00, 0x41 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x00, 0x41 }, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("A", output.items);
 }
 
@@ -1516,15 +1517,15 @@ test "CMap range mapping" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
 
-    try enc.decode(&[_]u8{ 0x01, 0x00 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x01, 0x00 }, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("X", output.items);
 
     output.clearRetainingCapacity();
-    try enc.decode(&[_]u8{ 0x01, 0x01 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x01, 0x01 }, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("Y", output.items);
 
     output.clearRetainingCapacity();
-    try enc.decode(&[_]u8{ 0x01, 0x02 }, output.writer(std.testing.allocator));
+    try enc.decode(&[_]u8{ 0x01, 0x02 }, compat.arrayListWriter(&output, std.testing.allocator));
     try std.testing.expectEqualStrings("Z", output.items);
 }
 

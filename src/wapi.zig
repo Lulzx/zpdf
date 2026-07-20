@@ -4,6 +4,7 @@
 //! Uses memory-based loading since file I/O is not available in WASM.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const zpdf = @import("root.zig");
 
 // Use WASM page allocator
@@ -86,7 +87,8 @@ export fn zpdf_extract_page(handle: i32, page_num: i32, out_len: *usize) ?[*]u8 
 
     if (documents[idx]) |doc| {
         var buffer: std.ArrayList(u8) = .empty;
-        doc.extractText(@intCast(page_num), buffer.writer(wasm_allocator)) catch return null;
+        defer buffer.deinit(wasm_allocator);
+        doc.extractText(@intCast(page_num), compat.arrayListWriter(&buffer, wasm_allocator)) catch return null;
 
         // Handle empty buffer - toOwnedSlice returns undefined ptr for empty slice
         if (buffer.items.len == 0) {
