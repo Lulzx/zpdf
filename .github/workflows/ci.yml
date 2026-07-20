@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Zig ${{ matrix.zig-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        zig-version:
+          - 0.15.2
+          - 0.16.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig-version }}
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build native targets
+        run: zig build
+
+      - name: Build WebAssembly target
+        run: zig build wasm
