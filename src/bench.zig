@@ -127,7 +127,8 @@ const CharCounter = struct {
 fn benchMutool(allocator: std.mem.Allocator, pdf_path: []const u8) !f64 {
     const start = compat.nanoTimestamp();
 
-    _ = try compat.runIgnored(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
+    const exit_code = try compat.runIgnored(&.{ "mutool", "draw", "-F", "txt", "-o", "/dev/null", pdf_path }, allocator);
+    if (exit_code != 0) return error.MutoolFailed;
 
     return @floatFromInt(compat.nanoTimestamp() - start);
 }
