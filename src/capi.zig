@@ -9,6 +9,24 @@ pub const ZpdfDocument = opaque {};
 
 var c_allocator: std.mem.Allocator = std.heap.page_allocator;
 
+pub const CError = enum(c_int) {
+    none = 0,
+    invalid_handle = 1,
+    page_not_found = 2,
+    extraction_failed = 3,
+    out_of_memory = 4,
+};
+
+threadlocal var last_error: CError = .none;
+
+fn setError(err: CError) void {
+    last_error = err;
+}
+
+export fn zpdf_last_error() c_int {
+    return @intFromEnum(last_error);
+}
+
 export fn zpdf_open(path_ptr: [*:0]const u8) ?*ZpdfDocument {
     const path = std.mem.span(path_ptr);
     const doc = zpdf.Document.open(c_allocator, path) catch return null;
@@ -52,18 +70,30 @@ export fn zpdf_is_encrypted(handle: ?*ZpdfDocument) bool {
 }
 
 export fn zpdf_extract_page(handle: ?*ZpdfDocument, page_num: c_int, out_len: *usize) ?[*]u8 {
+    setError(.none);
+    out_len.* = 0;
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
-        if (page_num < 0) return null;
+        if (page_num < 0 or @as(usize, @intCast(page_num)) >= doc.pages.items.len) {
+            setError(.page_not_found);
+            return null;
+        }
 
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(c_allocator);
-        doc.extractText(@intCast(page_num), compat.arrayListWriter(&buffer, c_allocator)) catch return null;
+        doc.extractText(@intCast(page_num), compat.arrayListWriter(&buffer, c_allocator)) catch {
+            setError(.extraction_failed);
+            return null;
+        };
 
-        const slice = buffer.toOwnedSlice(c_allocator) catch return null;
+        const slice = buffer.toOwnedSlice(c_allocator) catch {
+            setError(.out_of_memory);
+            return null;
+        };
         out_len.* = slice.len;
         return slice.ptr;
     }
+    setError(.invalid_handle);
     return null;
 }
 
@@ -75,12 +105,18 @@ export fn zpdf_extract_all(handle: ?*ZpdfDocument, out_len: *usize) ?[*]u8 {
 
 /// Extract all pages in fast stream-order mode.
 export fn zpdf_extract_all_fast(handle: ?*ZpdfDocument, out_len: *usize) ?[*]u8 {
+    setError(.none);
+    out_len.* = 0;
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
-        const result = doc.extractAllTextFast(c_allocator) catch return null;
+        const result = doc.extractAllTextFast(c_allocator) catch {
+            setError(.extraction_failed);
+            return null;
+        };
         out_len.* = result.len;
         return result.ptr;
     }
+    setError(.invalid_handle);
     return null;
 }
 
@@ -120,31 +156,43 @@ pub const CTextSpan = extern struct {
 };
 
 export fn zpdf_extract_bounds(handle: ?*ZpdfDocument, page_num: c_int, out_count: *usize) ?[*]CTextSpan {
+    setError(.none);
+    out_count.* = 0;
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
-        if (page_num < 0) return null;
+        if (page_num < 0 or @as(usize, @intCast(page_num)) >= doc.pages.items.len) {
+            setError(.page_not_found);
+            return null;
+        }
 
-        const spans = doc.extractTextWithBounds(@intCast(page_num), c_allocator) catch return null;
+        const spans = doc.extractTextWithBounds(@intCast(page_num), c_allocator) catch {
+            setError(.extraction_failed);
+            return null;
+        };
         defer zpdf.Document.freeTextSpans(c_allocator, spans);
         if (spans.len == 0) {
             out_count.* = 0;
             return null;
         }
 
-        const c_spans = c_allocator.alloc(CTextSpan, spans.len) catch return null;
+        const c_spans = c_allocator.alloc(CTextSpan, spans.len) catch {
+            setError(.out_of_memory);
+            return null;
+        };
         var copied: usize = 0;
-        errdefer {
-            for (0..copied) |i| {
-                const span = c_spans[i];
-                if (span.text_len > 0) {
-                    const ptr: [*]u8 = @ptrCast(@constCast(span.text));
-                    c_allocator.free(ptr[0..span.text_len]);
-                }
-            }
-            c_allocator.free(c_spans);
-        }
         for (spans, 0..) |span, i| {
-            const text_copy = c_allocator.dupe(u8, span.text) catch return null;
+            const text_copy = c_allocator.dupe(u8, span.text) catch {
+                for (0..copied) |copied_idx| {
+                    const copied_span = c_spans[copied_idx];
+                    if (copied_span.text_len > 0) {
+                        const ptr: [*]u8 = @ptrCast(@constCast(copied_span.text));
+                        c_allocator.free(ptr[0..copied_span.text_len]);
+                    }
+                }
+                c_allocator.free(c_spans);
+                setError(.out_of_memory);
+                return null;
+            };
             c_spans[i] = .{
                 .x0 = span.x0,
                 .y0 = span.y0,
@@ -160,6 +208,7 @@ export fn zpdf_extract_bounds(handle: ?*ZpdfDocument, page_num: c_int, out_count
         out_count.* = spans.len;
         return c_spans.ptr;
     }
+    setError(.invalid_handle);
     return null;
 }
 
@@ -178,16 +227,24 @@ export fn zpdf_free_bounds(ptr: ?[*]CTextSpan, count: usize) void {
 
 /// Extract text from a single page in reading order (visual order)
 export fn zpdf_extract_page_reading_order(handle: ?*ZpdfDocument, page_num: c_int, out_len: *usize) ?[*]u8 {
+    setError(.none);
+    out_len.* = 0;
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
-        if (page_num < 0 or @as(usize, @intCast(page_num)) >= doc.pages.items.len) return null;
+        if (page_num < 0 or @as(usize, @intCast(page_num)) >= doc.pages.items.len) {
+            setError(.page_not_found);
+            return null;
+        }
 
         const page_idx: usize = @intCast(page_num);
         const page = doc.pages.items[page_idx];
         const page_width = page.media_box[2] - page.media_box[0];
 
         // Extract spans with bounds
-        const spans = doc.extractTextWithBounds(page_idx, c_allocator) catch return null;
+        const spans = doc.extractTextWithBounds(page_idx, c_allocator) catch {
+            setError(.extraction_failed);
+            return null;
+        };
         if (spans.len == 0) {
             out_len.* = 0;
             return null;
@@ -195,26 +252,39 @@ export fn zpdf_extract_page_reading_order(handle: ?*ZpdfDocument, page_num: c_in
         defer zpdf.Document.freeTextSpans(c_allocator, spans);
 
         // Analyze layout for reading order
-        var layout_result = zpdf.layout.analyzeLayout(c_allocator, spans, page_width) catch return null;
+        var layout_result = zpdf.layout.analyzeLayout(c_allocator, spans, page_width) catch {
+            setError(.extraction_failed);
+            return null;
+        };
         defer layout_result.deinit();
 
         // Get text in reading order
-        const text = layout_result.getTextInOrder(c_allocator) catch return null;
+        const text = layout_result.getTextInOrder(c_allocator) catch {
+            setError(.extraction_failed);
+            return null;
+        };
         out_len.* = text.len;
         return text.ptr;
     }
+    setError(.invalid_handle);
     return null;
 }
 
 /// Extract text from all pages in reading order (sequential)
 /// Uses structure tree when available, falls back to geometric sorting
 export fn zpdf_extract_all_reading_order(handle: ?*ZpdfDocument, out_len: *usize) ?[*]u8 {
+    setError(.none);
+    out_len.* = 0;
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
-        const result = doc.extractAllTextStructured(c_allocator) catch return null;
+        const result = doc.extractAllTextStructured(c_allocator) catch {
+            setError(.extraction_failed);
+            return null;
+        };
         out_len.* = result.len;
         return result.ptr;
     }
+    setError(.invalid_handle);
     return null;
 }
 
@@ -225,22 +295,36 @@ export fn zpdf_extract_all_reading_order_parallel(handle: ?*ZpdfDocument, out_le
 
 /// Extract text from a single page as Markdown
 export fn zpdf_extract_page_markdown(handle: ?*ZpdfDocument, page_num: c_int, out_len: *usize) ?[*]u8 {
+    setError(.none);
+    out_len.* = 0;
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
-        if (page_num < 0 or @as(usize, @intCast(page_num)) >= doc.pages.items.len) return null;
+        if (page_num < 0 or @as(usize, @intCast(page_num)) >= doc.pages.items.len) {
+            setError(.page_not_found);
+            return null;
+        }
 
-        const result = doc.extractMarkdown(@intCast(page_num), c_allocator) catch return null;
+        const result = doc.extractMarkdown(@intCast(page_num), c_allocator) catch {
+            setError(.extraction_failed);
+            return null;
+        };
         out_len.* = result.len;
         return result.ptr;
     }
+    setError(.invalid_handle);
     return null;
 }
 
 /// Extract text from all pages as Markdown
 export fn zpdf_extract_all_markdown(handle: ?*ZpdfDocument, out_len: *usize) ?[*]u8 {
+    setError(.none);
+    out_len.* = 0;
     if (handle) |h| {
         const doc: *zpdf.Document = @ptrCast(@alignCast(h));
-        const result = doc.extractAllMarkdown(c_allocator) catch return null;
+        const result = doc.extractAllMarkdown(c_allocator) catch {
+            setError(.extraction_failed);
+            return null;
+        };
 
         // extractAllMarkdown returns an allocated slice; treat zero-length as "no data"
         if (result.len == 0) {
@@ -252,6 +336,7 @@ export fn zpdf_extract_all_markdown(handle: ?*ZpdfDocument, out_len: *usize) ?[*
         out_len.* = result.len;
         return result.ptr;
     }
+    setError(.invalid_handle);
     return null;
 }
 

@@ -107,6 +107,16 @@ zig build -Doptimize=ReleaseFast
 PYTHONPATH=python python3 examples/basic.py
 ```
 
+Build an installable, platform-specific wheel from the current Zig library:
+```bash
+python3 -m pip install build
+python3 -m build --wheel python
+```
+
+When developing from a checkout, the Python loader prefers `ZPDF_LIB` and
+`zig-out/lib` over any packaged library, so tests cannot silently use a stale
+binary.
+
 ## Project Structure
 
 ```

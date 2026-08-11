@@ -8,6 +8,10 @@ High-performance PDF text extraction powered by Zig. ~4x faster than MuPDF on la
 pip install zpdf
 ```
 
+To build a wheel from a source checkout, run `zig build -Doptimize=ReleaseFast`
+at the repository root, then `python -m build --wheel python`. Set `ZPDF_LIB`
+to select an explicit compatible shared library for testing or packaging.
+
 ## Usage
 
 ```python

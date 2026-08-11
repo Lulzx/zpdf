@@ -168,8 +168,10 @@ pub const Document = struct {
             @compileError("openFromMemoryOwned is not available on WASM. Use openFromMemory instead.");
         }
 
-        const doc = try allocator.create(Document);
-        errdefer allocator.destroy(doc);
+        const doc = allocator.create(Document) catch |err| {
+            std.posix.munmap(data);
+            return err;
+        };
 
         doc.* = .{
             .data = data,
@@ -185,6 +187,7 @@ pub const Document = struct {
             .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
             .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
         };
+        errdefer doc.close();
 
         try doc.parseDocument();
         return doc;
@@ -192,8 +195,10 @@ pub const Document = struct {
 
     /// Open from owned allocated memory (Windows - will be freed on close via allocator.free)
     fn openFromMemoryOwnedAlloc(allocator: std.mem.Allocator, data: []align(std.heap.page_size_min) u8, config: ErrorConfig) !*Document {
-        const doc = try allocator.create(Document);
-        errdefer allocator.destroy(doc);
+        const doc = allocator.create(Document) catch |err| {
+            allocator.free(data);
+            return err;
+        };
 
         doc.* = .{
             .data = data,
@@ -209,6 +214,7 @@ pub const Document = struct {
             .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
             .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
         };
+        errdefer doc.close();
 
         try doc.parseDocument();
         return doc;
@@ -218,7 +224,6 @@ pub const Document = struct {
     /// Caller must keep the memory alive until close().
     pub fn openFromMemoryUnsafe(allocator: std.mem.Allocator, data: []const u8, config: ErrorConfig) !*Document {
         const doc = try allocator.create(Document);
-        errdefer allocator.destroy(doc);
 
         doc.* = .{
             .data = data,
@@ -234,6 +239,7 @@ pub const Document = struct {
             .font_cache = std.StringHashMap(encoding.FontEncoding).init(allocator),
             .font_obj_cache = std.AutoHashMap(u32, encoding.FontEncoding).init(allocator),
         };
+        errdefer doc.close();
 
         try doc.parseDocument();
         return doc;
@@ -2514,4 +2520,25 @@ test "allocated memory path cleanup" {
 
     // Verify document parsed correctly
     try std.testing.expectEqual(@as(usize, 1), doc.pageCount());
+}
+
+test "constructor failures clean up initialized state and owned data" {
+    const allocator = std.testing.allocator;
+    const invalid = "not a pdf";
+
+    try std.testing.expectError(
+        error.InvalidPdfHeader,
+        Document.openFromMemoryUnsafe(allocator, invalid, ErrorConfig.strict()),
+    );
+
+    const aligned_data = try allocator.alignedAlloc(
+        u8,
+        .fromByteUnits(std.heap.page_size_min),
+        invalid.len,
+    );
+    @memcpy(aligned_data, invalid);
+    try std.testing.expectError(
+        error.InvalidPdfHeader,
+        Document.openFromMemoryOwnedAlloc(allocator, aligned_data, ErrorConfig.strict()),
+    );
 }

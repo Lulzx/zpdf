@@ -21,7 +21,7 @@ pub const CffParser = struct {
     top_dict_index: Index = undefined,
     string_index: Index = undefined,
     global_subr_index: Index = undefined,
-    
+
     // Top DICT data
     charstrings_offset: usize = 0,
     charset_offset: usize = 0,
@@ -32,7 +32,7 @@ pub const CffParser = struct {
     // Parsed tables
     charsets: []u16 = &[_]u16{}, // Map GID -> SID/CID. 0 means .notdef
     charstrings_index: Index = undefined,
-    
+
     // Standard strings (SIDs 0-390)
     const std_strings = @import("cff_std_strings.zig").std_strings;
 
@@ -69,13 +69,13 @@ pub const CffParser = struct {
 
         // 2. Name INDEX
         self.name_index = try Index.parse(&cursor);
-        
+
         // 3. Top DICT INDEX
         self.top_dict_index = try Index.parse(&cursor);
-        
+
         // 4. String INDEX
         self.string_index = try Index.parse(&cursor);
-        
+
         // 5. Global Subr INDEX
         self.global_subr_index = try Index.parse(&cursor);
 
@@ -111,7 +111,7 @@ pub const CffParser = struct {
                     if (op.operands.len > 0) self.charstrings_offset = @intCast(op.operands[0]);
                 },
                 18 => { // Private
-                     if (op.operands.len >= 2) {
+                    if (op.operands.len >= 2) {
                         self.private_dict_size = @intCast(op.operands[0]);
                         self.private_dict_offset = @intCast(op.operands[1]);
                     }
@@ -138,12 +138,12 @@ pub const CffParser = struct {
         var cursor = Cursor{ .data = self.data, .pos = self.charset_offset };
         const format = cursor.readCard8();
         const num_glyphs = self.charstrings_index.count;
-        
+
         self.charsets = try self.allocator.alloc(u16, num_glyphs);
         self.charsets[0] = 0; // .notdef
 
         var gid: usize = 1;
-        
+
         switch (format) {
             0 => { // Format 0
                 while (gid < num_glyphs and cursor.remaining() >= 2) {
@@ -169,7 +169,7 @@ pub const CffParser = struct {
                     const first_sid = cursor.readCard16();
                     const n_left = cursor.readCard16();
                     for (0..(n_left + 1)) |i| {
-                         if (gid + i < num_glyphs) {
+                        if (gid + i < num_glyphs) {
                             self.charsets[gid + i] = first_sid + @as(u16, @intCast(i));
                         }
                     }
@@ -251,20 +251,20 @@ const Index = struct {
 
         if (cursor.remaining() < 1) return CffError.TruncatedData;
         const off_size = cursor.readCard8();
-        
+
         const offsets_offset = cursor.pos;
         // Skip offsets array: (count + 1) * off_size
         const offsets_len = (count + 1) * @as(usize, off_size);
         if (cursor.remaining() < offsets_len) return CffError.TruncatedData;
-        
+
         // Read last offset to skip data
         // We need to peek at the last offset to know data size
         var temp_cursor = Cursor{ .data = cursor.data, .pos = offsets_offset + (count * off_size) };
         const data_size = temp_cursor.readOffSize(off_size) - 1; // Offsets are 1-based usually relative to data start
-        
+
         cursor.pos += offsets_len;
         const data_offset = cursor.pos;
-        
+
         // Skip data
         // Note: The offsets in the index are relative to the byte preceding the data array
         // (i.e., the first offset is always 1). So total data length is last_offset - 1.
@@ -280,21 +280,21 @@ const Index = struct {
 
     fn getData(self: Index, full_data: []const u8, index: usize) []const u8 {
         if (index >= self.count) return &[_]u8{};
-        
+
         // Read offset[index]
         var cursor = Cursor{ .data = full_data, .pos = self.offsets_offset + (index * self.off_size) };
         const start = cursor.readOffSize(self.off_size);
         const end = cursor.readOffSize(self.off_size);
-        
+
         // Offsets are relative to byte preceding data array. So offset 1 means start of data.
         // real_start = data_offset + start - 1
         const real_start = self.data_offset + start - 1;
         const real_end = self.data_offset + end - 1;
-        
+
         if (real_start >= full_data.len or real_end > full_data.len or real_start > real_end) {
             return &[_]u8{};
         }
-        
+
         return full_data[real_start..real_end];
     }
 };
@@ -307,9 +307,9 @@ const DictParser = struct {
         operator: u16,
         operands: []const i32,
     };
-    
+
     // Max operands per operator
-    var operand_buf: [48]i32 = undefined; 
+    var operand_buf: [48]i32 = undefined;
 
     fn next(self: *DictParser) !?Op {
         if (self.pos >= self.data.len) return null;
@@ -335,18 +335,18 @@ const DictParser = struct {
                 operand_buf[op_count] = try self.readNumber();
                 op_count += 1;
             } else {
-                 // Reserved or 31 (which is also number prefix 30?) - 30 is representation for real number
-                 // standard says:
-                 // 32-246: int
-                 // 247-250: +int
-                 // 251-254: -int
-                 // 255: reserved
-                 // 28: shortint
-                 // 29: longint
-                 // 30: real
-                 if (op_count >= operand_buf.len) return CffError.StackUnderflow;
-                 operand_buf[op_count] = try self.readNumber();
-                 op_count += 1;
+                // Reserved or 31 (which is also number prefix 30?) - 30 is representation for real number
+                // standard says:
+                // 32-246: int
+                // 247-250: +int
+                // 251-254: -int
+                // 255: reserved
+                // 28: shortint
+                // 29: longint
+                // 30: real
+                if (op_count >= operand_buf.len) return CffError.StackUnderflow;
+                operand_buf[op_count] = try self.readNumber();
+                op_count += 1;
             }
         }
         return null;
@@ -360,7 +360,7 @@ const DictParser = struct {
         if (b0 == 28) { // shortint
             if (self.pos + 1 >= self.data.len) return CffError.TruncatedData;
             const b1 = self.data[self.pos];
-            const b2 = self.data[self.pos+1];
+            const b2 = self.data[self.pos + 1];
             self.pos += 2;
             return @as(i16, @bitCast(@as(u16, (@as(u16, b1) << 8) | b2)));
         } else if (b0 == 29) { // longint
@@ -396,14 +396,31 @@ const DictParser = struct {
                                 buf_len += 1;
                             }
                         },
-                        0xA => { if (buf_len < buf.len) { buf[buf_len] = '.'; buf_len += 1; } },
-                        0xB => { if (buf_len < buf.len) { buf[buf_len] = 'E'; buf_len += 1; } },
-                        0xC => {
-                            if (buf_len + 2 <= buf.len) {
-                                buf[buf_len] = 'E'; buf[buf_len + 1] = '-'; buf_len += 2;
+                        0xA => {
+                            if (buf_len < buf.len) {
+                                buf[buf_len] = '.';
+                                buf_len += 1;
                             }
                         },
-                        0xE => { if (buf_len < buf.len) { buf[buf_len] = '-'; buf_len += 1; } },
+                        0xB => {
+                            if (buf_len < buf.len) {
+                                buf[buf_len] = 'E';
+                                buf_len += 1;
+                            }
+                        },
+                        0xC => {
+                            if (buf_len + 2 <= buf.len) {
+                                buf[buf_len] = 'E';
+                                buf[buf_len + 1] = '-';
+                                buf_len += 2;
+                            }
+                        },
+                        0xE => {
+                            if (buf_len < buf.len) {
+                                buf[buf_len] = '-';
+                                buf_len += 1;
+                            }
+                        },
                         0xF => break :outer,
                         else => {},
                     }

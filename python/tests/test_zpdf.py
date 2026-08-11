@@ -386,6 +386,31 @@ class TestPageInfoRepr:
             assert "height=" in r
 
 
+class TestNativeErrors:
+    def test_null_handle_sets_explicit_error(self):
+        from zpdf._ffi import ffi, lib
+
+        out_len = ffi.new("size_t*")
+        assert lib.zpdf_extract_page(ffi.NULL, 0, out_len) == ffi.NULL
+        assert lib.zpdf_last_error() == 1
+
+    def test_invalid_page_sets_explicit_error(self):
+        from zpdf._ffi import ffi, lib
+
+        with zpdf.Document(TEST_PDF) as doc:
+            out_len = ffi.new("size_t*")
+            assert lib.zpdf_extract_page(doc._handle, 999999, out_len) == ffi.NULL
+            assert out_len[0] == 0
+            assert lib.zpdf_last_error() == 2
+
+    @pytest.mark.parametrize("method", ["get_page_label", "get_links", "get_images"])
+    @pytest.mark.parametrize("page_num", [-1, 999999])
+    def test_page_helpers_reject_invalid_pages(self, method, page_num):
+        with zpdf.Document(TEST_PDF) as doc:
+            with pytest.raises(zpdf.PageNotFoundError):
+                getattr(doc, method)(page_num)
+
+
 class TestMultiPageSeparators:
     """Test that multi-page documents include page separators."""
 

@@ -15,7 +15,7 @@ pub const main = compat.MainWithArgs(mainInner).main;
 fn mainInner(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) {
         try printUsage();
-        return;
+        return error.InvalidArguments;
     }
 
     const command = args[1];
@@ -33,6 +33,7 @@ fn mainInner(allocator: std.mem.Allocator, args: []const []const u8) !void {
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         try printUsage();
+        return error.InvalidArguments;
     }
 }
 
@@ -103,10 +104,12 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         if (std.mem.eql(u8, arg, "-o")) {
             i += 1;
-            if (i < args.len) output_file = args[i];
+            if (i >= args.len) return error.MissingOptionValue;
+            output_file = args[i];
         } else if (std.mem.eql(u8, arg, "-p")) {
             i += 1;
-            if (i < args.len) page_range = args[i];
+            if (i >= args.len) return error.MissingOptionValue;
+            page_range = args[i];
         } else if (std.mem.eql(u8, arg, "--strict")) {
             error_mode = zpdf.ErrorConfig.strict();
         } else if (std.mem.eql(u8, arg, "--permissive")) {
@@ -117,37 +120,40 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
             output_format = .markdown;
         } else if (std.mem.eql(u8, arg, "--format") or std.mem.eql(u8, arg, "-f")) {
             i += 1;
-            if (i < args.len) {
-                const fmt = args[i];
-                if (std.mem.eql(u8, fmt, "text") or std.mem.eql(u8, fmt, "txt")) {
-                    output_format = .text;
-                } else if (std.mem.eql(u8, fmt, "json")) {
-                    output_format = .json;
-                } else if (std.mem.eql(u8, fmt, "markdown") or std.mem.eql(u8, fmt, "md")) {
-                    output_format = .markdown;
-                } else {
-                    std.debug.print("Unknown format: {s}. Use text, json, or markdown.\n", .{fmt});
-                    return;
-                }
+            if (i >= args.len) return error.MissingOptionValue;
+            const fmt = args[i];
+            if (std.mem.eql(u8, fmt, "text") or std.mem.eql(u8, fmt, "txt")) {
+                output_format = .text;
+            } else if (std.mem.eql(u8, fmt, "json")) {
+                output_format = .json;
+            } else if (std.mem.eql(u8, fmt, "markdown") or std.mem.eql(u8, fmt, "md")) {
+                output_format = .markdown;
+            } else {
+                std.debug.print("Unknown format: {s}. Use text, json, or markdown.\n", .{fmt});
+                return error.InvalidArguments;
             }
         } else if (std.mem.eql(u8, arg, "--sequential")) {
             sequential = true;
         } else if (std.mem.eql(u8, arg, "--reading-order")) {
             extraction_mode = .visual;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            return error.InvalidArguments;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (input_file != null) return error.TooManyArguments;
             input_file = arg;
         }
     }
 
     const path = input_file orelse {
         std.debug.print("Error: No input file specified\n", .{});
-        return;
+        return error.InvalidArguments;
     };
 
     // Open document
     const doc = zpdf.Document.openWithConfig(allocator, path, error_mode) catch |err| {
         std.debug.print("Error opening {s}: {}\n", .{ path, err });
-        return;
+        return err;
     };
     defer doc.close();
 
@@ -160,7 +166,7 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const output_handle = if (output_file) |out_path|
         compat.createFileCwd(out_path) catch |err| {
             std.debug.print("Error creating {s}: {}\n", .{ out_path, err });
-            return;
+            return err;
         }
     else
         null;
@@ -169,7 +175,7 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Parse page range
     const pages = parsePageRange(allocator, page_range, doc.pages.items.len) catch |err| {
         std.debug.print("Error parsing page range: {}\n", .{err});
-        return;
+        return err;
     };
     defer allocator.free(pages);
 
@@ -183,38 +189,38 @@ fn runExtract(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (output_format == .markdown and page_range == null) {
         const result = doc.extractAllMarkdown(allocator) catch |err| {
             std.debug.print("Error during markdown extraction: {}\n", .{err});
-            return;
+            return err;
         };
         defer allocator.free(result);
 
         if (output_handle) |h| {
             compat.writeAllFile(h, result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
-                return;
+                return err;
             };
         } else {
             compat.writeAllStdout(result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
-                return;
+                return err;
             };
         }
     } else if (use_parallel) {
         // Structure tree extraction (uses stream order as fallback)
         const result = doc.extractAllTextStructured(allocator) catch |err| {
             std.debug.print("Error during structured extraction: {}\n", .{err});
-            return;
+            return err;
         };
         defer allocator.free(result);
 
         if (output_handle) |h| {
             compat.writeAllFile(h, result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
-                return;
+                return err;
             };
         } else {
             compat.writeAllStdout(result) catch |err| {
                 std.debug.print("Error writing output: {}\n", .{err});
-                return;
+                return err;
             };
         }
     } else if (output_handle) |h| {
@@ -324,7 +330,7 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
             .markdown => {
                 const text = doc.extractMarkdown(page_num, allocator) catch |err| {
                     std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-                    continue;
+                    return err;
                 };
                 defer allocator.free(text);
                 try writer.writeAll(text);
@@ -336,11 +342,11 @@ fn doExtract(doc: *zpdf.Document, pages: []const usize, output_format: OutputFor
                 const text = switch (extraction_mode) {
                     .normal => doc.extractTextStructured(page_num, allocator) catch |err| {
                         std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-                        continue;
+                        return err;
                     },
                     .visual => extractPageReadingOrder(doc, page_num, allocator) catch |err| {
                         std.debug.print("Error extracting page {}: {}\n", .{ page_num + 1, err });
-                        continue;
+                        return err;
                     },
                 };
                 defer allocator.free(text);
@@ -538,16 +544,16 @@ fn extractAllTextReadingOrderParallel(doc: *zpdf.Document, allocator: std.mem.Al
 }
 
 fn runInfo(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len == 0) {
+    if (args.len != 1) {
         std.debug.print("Error: No input file specified\n", .{});
-        return;
+        return error.InvalidArguments;
     }
 
     const path = args[0];
 
     const doc = zpdf.Document.open(allocator, path) catch |err| {
         std.debug.print("Error opening {s}: {}\n", .{ path, err });
-        return;
+        return err;
     };
     defer doc.close();
 
@@ -645,9 +651,9 @@ fn runInfo(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn runSearch(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len < 2) {
+    if (args.len != 2) {
         std.debug.print("Usage: zpdf search <query> <input.pdf>\n", .{});
-        return;
+        return error.InvalidArguments;
     }
 
     const query = args[0];
@@ -655,13 +661,13 @@ fn runSearch(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const doc = zpdf.Document.openWithConfig(allocator, path, zpdf.ErrorConfig.default()) catch |err| {
         std.debug.print("Error opening {s}: {}\n", .{ path, err });
-        return;
+        return err;
     };
     defer doc.close();
 
     const results = doc.search(allocator, query) catch |err| {
         std.debug.print("Error searching: {}\n", .{err});
-        return;
+        return err;
     };
     defer zpdf.Document.freeSearchResults(allocator, results);
 
@@ -694,11 +700,14 @@ fn runSearch(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn runBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) {
         std.debug.print("Error: No input file specified\n", .{});
-        return;
+        return error.InvalidArguments;
     }
 
     const path = args[0];
-    const parallel = args.len > 1 and std.mem.eql(u8, args[1], "--parallel");
+    if (args.len > 2 or (args.len == 2 and !std.mem.eql(u8, args[1], "--parallel"))) {
+        return error.InvalidArguments;
+    }
+    const parallel = args.len == 2;
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_bw = compat.stdoutWriter(&stdout_buf);
@@ -716,7 +725,7 @@ fn runBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         const doc = zpdf.Document.open(allocator, path) catch |err| {
             std.debug.print("Error opening {s}: {}\n", .{ path, err });
-            return;
+            return err;
         };
         page_count = doc.pages.items.len;
 
@@ -797,7 +806,7 @@ const CharCounter = struct {
 };
 
 fn parsePageRange(allocator: std.mem.Allocator, range_str: ?[]const u8, total_pages: usize) ![]usize {
-    if (range_str == null or range_str.?.len == 0) {
+    if (range_str == null) {
         // Return all pages
         const pages = try allocator.alloc(usize, total_pages);
         for (pages, 0..) |*p, i| {
@@ -807,50 +816,53 @@ fn parsePageRange(allocator: std.mem.Allocator, range_str: ?[]const u8, total_pa
     }
 
     const spec = range_str.?;
+    if (spec.len == 0) return error.InvalidPageRange;
+    var pages: std.ArrayList(usize) = .empty;
+    errdefer pages.deinit(allocator);
 
-    // Count how many pages we'll need
-    var count: usize = 0;
     var iter = std.mem.splitScalar(u8, spec, ',');
     while (iter.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " ");
+        if (trimmed.len == 0) return error.InvalidPageRange;
+
         if (std.mem.indexOf(u8, trimmed, "-")) |dash_pos| {
+            if (std.mem.indexOfPos(u8, trimmed, dash_pos + 1, "-") != null) return error.InvalidPageRange;
             const start_str = trimmed[0..dash_pos];
             const end_str = trimmed[dash_pos + 1 ..];
-            const start = (std.fmt.parseInt(usize, start_str, 10) catch 1) -| 1;
-            const end = std.fmt.parseInt(usize, end_str, 10) catch total_pages;
-            count += @min(end, total_pages) -| start;
+            if (start_str.len == 0 or end_str.len == 0) return error.InvalidPageRange;
+            const start_one = std.fmt.parseInt(usize, start_str, 10) catch return error.InvalidPageRange;
+            const end_one = std.fmt.parseInt(usize, end_str, 10) catch return error.InvalidPageRange;
+            if (start_one == 0 or end_one == 0 or start_one > end_one or end_one > total_pages) {
+                return error.PageOutOfRange;
+            }
+
+            var page = start_one - 1;
+            while (page < end_one) : (page += 1) {
+                try pages.append(allocator, page);
+            }
         } else {
-            count += 1;
+            const page_one = std.fmt.parseInt(usize, trimmed, 10) catch return error.InvalidPageRange;
+            if (page_one == 0 or page_one > total_pages) return error.PageOutOfRange;
+            try pages.append(allocator, page_one - 1);
         }
     }
 
-    var pages = try allocator.alloc(usize, count);
-    var idx: usize = 0;
+    if (pages.items.len == 0) return error.InvalidPageRange;
+    return pages.toOwnedSlice(allocator);
+}
 
-    iter = std.mem.splitScalar(u8, spec, ',');
-    while (iter.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " ");
-        if (std.mem.indexOf(u8, trimmed, "-")) |dash_pos| {
-            const start_str = trimmed[0..dash_pos];
-            const end_str = trimmed[dash_pos + 1 ..];
-            const start = (std.fmt.parseInt(usize, start_str, 10) catch 1) -| 1;
-            const end = std.fmt.parseInt(usize, end_str, 10) catch total_pages;
+test "parsePageRange accepts pages and inclusive ranges" {
+    const pages = try parsePageRange(std.testing.allocator, "1,3-5", 5);
+    defer std.testing.allocator.free(pages);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3, 4 }, pages);
+}
 
-            var page = start;
-            while (page < @min(end, total_pages)) : (page += 1) {
-                if (idx < pages.len) {
-                    pages[idx] = page;
-                    idx += 1;
-                }
-            }
-        } else {
-            const page = (std.fmt.parseInt(usize, trimmed, 10) catch continue) -| 1;
-            if (page < total_pages and idx < pages.len) {
-                pages[idx] = page;
-                idx += 1;
-            }
-        }
+test "parsePageRange rejects malformed and out-of-range input without leaking" {
+    const invalid = [_][]const u8{ "nope", "2,nope", "", ",", "1,", "-2", "2-", "3-2", "0", "6", "1-6", "1-2-3" };
+    for (invalid) |spec| {
+        try std.testing.expectError(
+            if (std.mem.eql(u8, spec, "0") or std.mem.eql(u8, spec, "6") or std.mem.eql(u8, spec, "1-6") or std.mem.eql(u8, spec, "3-2")) error.PageOutOfRange else error.InvalidPageRange,
+            parsePageRange(std.testing.allocator, spec, 5),
+        );
     }
-
-    return pages[0..idx];
 }

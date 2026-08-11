@@ -352,93 +352,93 @@ pub const MarkdownRenderer = struct {
                     else => false,
                 };
                 if (needs_blank and output.items.len > 0) {
-                    try output.append(self.allocator,'\n');
+                    try output.append(self.allocator, '\n');
                 }
             }
 
             switch (elem.kind) {
                 .heading1 => {
-                    try output.appendSlice(self.allocator,"# ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "# ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .heading2 => {
-                    try output.appendSlice(self.allocator,"## ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "## ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .heading3 => {
-                    try output.appendSlice(self.allocator,"### ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "### ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .heading4 => {
-                    try output.appendSlice(self.allocator,"#### ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "#### ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .heading5 => {
-                    try output.appendSlice(self.allocator,"##### ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "##### ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .heading6 => {
-                    try output.appendSlice(self.allocator,"###### ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "###### ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .paragraph => {
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .list_item_bullet => {
                     // Add indentation
                     var indent: u8 = 0;
                     while (indent < elem.indent_level) : (indent += 1) {
-                        try output.appendSlice(self.allocator,"  ");
+                        try output.appendSlice(self.allocator, "  ");
                     }
-                    try output.appendSlice(self.allocator,"- ");
+                    try output.appendSlice(self.allocator, "- ");
                     // Strip bullet character from text
                     const text = self.stripBullet(elem.text);
-                    try output.appendSlice(self.allocator,text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, text);
+                    try output.append(self.allocator, '\n');
                 },
                 .list_item_number => {
                     var indent: u8 = 0;
                     while (indent < elem.indent_level) : (indent += 1) {
-                        try output.appendSlice(self.allocator,"  ");
+                        try output.appendSlice(self.allocator, "  ");
                     }
                     // Keep original numbering or normalize
                     const text = self.stripNumberPrefix(elem.text);
-                    try output.appendSlice(self.allocator,"1. ");
-                    try output.appendSlice(self.allocator,text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "1. ");
+                    try output.appendSlice(self.allocator, text);
+                    try output.append(self.allocator, '\n');
                 },
                 .table_row => {
-                    try output.appendSlice(self.allocator,"| ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.appendSlice(self.allocator," |\n");
+                    try output.appendSlice(self.allocator, "| ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.appendSlice(self.allocator, " |\n");
                 },
                 .code_block => {
-                    try output.appendSlice(self.allocator,"```\n");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.appendSlice(self.allocator,"\n```\n");
+                    try output.appendSlice(self.allocator, "```\n");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.appendSlice(self.allocator, "\n```\n");
                 },
                 .code_inline => {
-                    try output.append(self.allocator,'`');
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'`');
+                    try output.append(self.allocator, '`');
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '`');
                 },
                 .blockquote => {
-                    try output.appendSlice(self.allocator,"> ");
-                    try output.appendSlice(self.allocator,elem.text);
-                    try output.append(self.allocator,'\n');
+                    try output.appendSlice(self.allocator, "> ");
+                    try output.appendSlice(self.allocator, elem.text);
+                    try output.append(self.allocator, '\n');
                 },
                 .horizontal_rule => {
-                    try output.appendSlice(self.allocator,"\n---\n\n");
+                    try output.appendSlice(self.allocator, "\n---\n\n");
                 },
                 .line_break => {
-                    try output.append(self.allocator,'\n');
+                    try output.append(self.allocator, '\n');
                 },
             }
 

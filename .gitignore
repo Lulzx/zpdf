@@ -12,6 +12,12 @@ zig-out/
 .DS_Store
 Thumbs.db
 __pycache__/
+*.egg-info/
+python/zpdf/libzpdf.dylib
+python/zpdf/libzpdf.so
+python/zpdf/zpdf.dll
+python/build/
+python/dist/
 
 # Test files
 test/
