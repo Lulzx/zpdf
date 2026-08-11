@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zpdf"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance PDF text extraction powered by Zig"
 readme = "README.md"
 license = { text = "CC0-1.0" }
