@@ -33,6 +33,9 @@ Issues = "https://github.com/Lulzx/zpdf/issues"
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["zpdf*"]

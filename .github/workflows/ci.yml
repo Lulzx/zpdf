@@ -32,8 +32,61 @@ jobs:
       - name: Run tests
         run: zig build test
 
+      - name: Run ReleaseSafe tests
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Check formatting
+        run: zig fmt --check build.zig gen_test.zig src/*.zig
+
       - name: Build native targets
         run: zig build
 
       - name: Build WebAssembly target
         run: zig build wasm
+
+  python:
+    name: Python ${{ matrix.python-version }} bindings and wheel
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build current native library and test fixture
+        run: |
+          zig build
+          mkdir -p test
+          zig run gen_test.zig -- test/test.pdf
+
+      - name: Install test and packaging tools
+        run: python -m pip install "pytest<9" cffi "build<2"
+
+      - name: Test bindings against current library
+        env:
+          ZPDF_LIB: ${{ github.workspace }}/zig-out/lib/libzpdf.so
+        run: PYTHONPATH=python python -m pytest python/tests -q
+
+      - name: Build platform wheel
+        env:
+          ZPDF_LIB: ${{ github.workspace }}/zig-out/lib/libzpdf.so
+        run: python -m build --wheel python
+
+      - name: Verify installed wheel in isolation
+        run: |
+          python -m venv /tmp/zpdf-wheel-test
+          /tmp/zpdf-wheel-test/bin/pip install python/dist/*.whl
+          cd /tmp
+          /tmp/zpdf-wheel-test/bin/python -c "import zpdf; print(zpdf.__version__)"

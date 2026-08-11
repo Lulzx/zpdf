@@ -130,54 +130,60 @@ fn decodeFlateDecode(
     data: []const u8,
     params: ?Object,
 ) ![]u8 {
+    return decodeFlateDecodeWithLimit(allocator, data, params, MAX_DECOMPRESSED_SIZE);
+}
+
+fn decodeFlateDecodeWithLimit(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    params: ?Object,
+    max_size: usize,
+) ![]u8 {
     // Use Zig's built-in zlib/flate decompressor
     var input: std.Io.Reader = .fixed(data);
-    var decomp: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
+    var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var decomp: std.compress.flate.Decompress = .init(&input, .zlib, &decompress_buffer);
 
-    // Read all decompressed data using allocating writer
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    _ = decomp.reader.streamRemaining(&aw.writer) catch |err| {
-        // Some PDFs have truncated streams - try to use what we have
-        if (aw.written().len > 0 and err == error.EndOfStream) {
-            // Continue with what we have
-        } else {
-            return DecompressError.DecompressFailed;
-        }
-    };
-
-    if (aw.written().len > MAX_DECOMPRESSED_SIZE) {
-        return DecompressError.OutputTooLarge;
+    // Pull bounded chunks so a compression bomb cannot allocate beyond the cap.
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = decomp.reader.readSliceShort(&chunk) catch return DecompressError.DecompressFailed;
+        if (output.items.len > max_size or n > max_size - output.items.len) return DecompressError.OutputTooLarge;
+        const new_len = output.items.len + n;
+        try output.ensureTotalCapacityPrecise(allocator, new_len);
+        output.appendSliceAssumeCapacity(chunk[0..n]);
+        if (n < chunk.len) break;
     }
 
     // Apply predictor if specified
     if (params) |p| {
         if (p == .dict) {
-            const predictor = if (p.dict.get("Predictor")) |pred|
-                if (pred == .integer) @as(i32, @intCast(pred.integer)) else 1
-            else
-                1;
+            const predictor = if (p.dict.get("Predictor")) |pred| switch (pred) {
+                .integer => |value| std.math.cast(i32, value) orelse return DecompressError.InvalidFilterParams,
+                else => 1,
+            } else 1;
 
             if (predictor > 1) {
-                const columns = if (p.dict.get("Columns")) |c|
-                    if (c == .integer) @as(u32, @intCast(c.integer)) else 1
-                else
-                    1;
+                const columns = if (p.dict.get("Columns")) |c| switch (c) {
+                    .integer => |value| std.math.cast(u32, value) orelse return DecompressError.InvalidFilterParams,
+                    else => 1,
+                } else 1;
 
-                const colors = if (p.dict.get("Colors")) |c|
-                    if (c == .integer) @as(u32, @intCast(c.integer)) else 1
-                else
-                    1;
+                const colors = if (p.dict.get("Colors")) |c| switch (c) {
+                    .integer => |value| std.math.cast(u32, value) orelse return DecompressError.InvalidFilterParams,
+                    else => 1,
+                } else 1;
 
-                const bits = if (p.dict.get("BitsPerComponent")) |b|
-                    if (b == .integer) @as(u32, @intCast(b.integer)) else 8
-                else
-                    8;
+                const bits = if (p.dict.get("BitsPerComponent")) |b| switch (b) {
+                    .integer => |value| std.math.cast(u32, value) orelse return DecompressError.InvalidFilterParams,
+                    else => 8,
+                } else 8;
 
                 const unpredicted = try applyPredictor(
                     allocator,
-                    aw.written(),
+                    output.items,
                     predictor,
                     columns,
                     colors,
@@ -188,7 +194,7 @@ fn decodeFlateDecode(
         }
     }
 
-    return try allocator.dupe(u8, aw.written());
+    return output.toOwnedSlice(allocator);
 }
 
 /// Apply PNG predictor to decoded data
@@ -225,9 +231,9 @@ fn applyTiffPredictor(
     colors: u32,
     bits: u32,
 ) ![]u8 {
-    _ = bits; // TODO: handle non-8-bit
-
-    const bytes_per_row = columns * colors;
+    if (columns == 0 or colors == 0 or bits != 8) return DecompressError.InvalidFilterParams;
+    const bytes_per_row = std.math.mul(usize, columns, colors) catch return DecompressError.InvalidFilterParams;
+    if (bytes_per_row == 0) return DecompressError.InvalidFilterParams;
     const num_rows = data.len / bytes_per_row;
 
     var output = try allocator.alloc(u8, data.len);
@@ -261,12 +267,22 @@ fn applyPngPredictor(
     colors: u32,
     bits: u32,
 ) ![]u8 {
-    const bytes_per_pixel = (colors * bits + 7) / 8;
-    const row_bytes = (columns * colors * bits + 7) / 8;
-    const src_row_bytes = row_bytes + 1; // +1 for filter type byte
+    if (columns == 0 or colors == 0 or
+        !(bits == 1 or bits == 2 or bits == 4 or bits == 8 or bits == 16))
+    {
+        return DecompressError.InvalidFilterParams;
+    }
+    const pixel_bits = std.math.mul(usize, colors, bits) catch return DecompressError.InvalidFilterParams;
+    const row_bits = std.math.mul(usize, columns, pixel_bits) catch return DecompressError.InvalidFilterParams;
+    const rounded_pixel_bits = std.math.add(usize, pixel_bits, 7) catch return DecompressError.InvalidFilterParams;
+    const rounded_row_bits = std.math.add(usize, row_bits, 7) catch return DecompressError.InvalidFilterParams;
+    const row_bytes = rounded_row_bits / 8;
+    const src_row_bytes = std.math.add(usize, row_bytes, 1) catch return DecompressError.InvalidFilterParams;
+    const bytes_per_pixel = rounded_pixel_bits / 8;
+    if (bytes_per_pixel == 0 or row_bytes == 0) return DecompressError.InvalidFilterParams;
 
     const num_rows = data.len / src_row_bytes;
-    const out_len = num_rows * row_bytes;
+    const out_len = std.math.mul(usize, num_rows, row_bytes) catch return DecompressError.InvalidFilterParams;
 
     var output = try allocator.alloc(u8, out_len);
     errdefer allocator.free(output);
@@ -487,20 +503,29 @@ fn decodeLZW(
             return table;
         }
 
-        fn add(self: *@This(), entry: []const u8) void {
+        fn add(self: *@This(), entry: []const u8) bool {
             if (self.size < 4096) {
                 self.entries[self.size] = entry;
                 self.size += 1;
+                return true;
             }
+            return false;
         }
 
         fn get(self: @This(), code: u16) ?[]const u8 {
             if (code < self.size) return self.entries[code];
             return null;
         }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            var i: u16 = 258;
+            while (i < self.size) : (i += 1) alloc.free(@constCast(self.entries[i]));
+            self.size = 258;
+        }
     };
 
     var table = LzwTable.init();
+    defer table.deinit(allocator);
     var bit_pos: usize = 0;
     var code_size: u4 = 9;
     var prev_code: ?u16 = null;
@@ -512,6 +537,7 @@ fn decodeLZW(
 
         // Clear table
         if (code == 256) {
+            table.deinit(allocator);
             table = LzwTable.init();
             code_size = 9;
             prev_code = null;
@@ -523,6 +549,7 @@ fn decodeLZW(
 
         // Output string for code
         if (table.get(code)) |entry| {
+            if (entry.len > MAX_DECOMPRESSED_SIZE - output.items.len) return DecompressError.OutputTooLarge;
             try output.appendSlice(allocator, entry);
 
             if (prev_code) |pc| {
@@ -531,7 +558,7 @@ fn decodeLZW(
                     var new_entry = try allocator.alloc(u8, prev_entry.len + 1);
                     @memcpy(new_entry[0..prev_entry.len], prev_entry);
                     new_entry[prev_entry.len] = entry[0];
-                    table.add(new_entry);
+                    if (!table.add(new_entry)) allocator.free(new_entry);
                 }
             }
         } else if (prev_code) |pc| {
@@ -540,8 +567,15 @@ fn decodeLZW(
                 var new_entry = try allocator.alloc(u8, prev_entry.len + 1);
                 @memcpy(new_entry[0..prev_entry.len], prev_entry);
                 new_entry[prev_entry.len] = prev_entry[0];
-                try output.appendSlice(allocator, new_entry);
-                table.add(new_entry);
+                if (new_entry.len > MAX_DECOMPRESSED_SIZE - output.items.len) {
+                    allocator.free(new_entry);
+                    return DecompressError.OutputTooLarge;
+                }
+                output.appendSlice(allocator, new_entry) catch |err| {
+                    allocator.free(new_entry);
+                    return err;
+                };
+                if (!table.add(new_entry)) allocator.free(new_entry);
             }
         }
 
@@ -593,12 +627,14 @@ fn decodeRunLength(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
             // Copy next length+1 bytes literally
             const copy_len = @as(usize, length) + 1;
             if (i + copy_len > data.len) break;
+            if (copy_len > MAX_DECOMPRESSED_SIZE - output.items.len) return DecompressError.OutputTooLarge;
             try output.appendSlice(allocator, data[i..][0..copy_len]);
             i += copy_len;
         } else {
             // Repeat next byte (257-length) times
             const repeat_count = 257 - @as(usize, length);
             if (i >= data.len) break;
+            if (repeat_count > MAX_DECOMPRESSED_SIZE - output.items.len) return DecompressError.OutputTooLarge;
             const byte = data[i];
             i += 1;
             try output.appendNTimes(allocator, byte, repeat_count);
@@ -654,4 +690,30 @@ test "decodeRunLength" {
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings("ABCXXX", result);
+}
+
+test "predictors reject unsafe dimensions and unsupported TIFF bit depths" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidFilterParams, applyTiffPredictor(allocator, "abc", 0, 1, 8));
+    try std.testing.expectError(error.InvalidFilterParams, applyTiffPredictor(allocator, "abc", 1, 0, 8));
+    try std.testing.expectError(error.InvalidFilterParams, applyTiffPredictor(allocator, "abc", 1, 1, 4));
+    try std.testing.expectError(error.InvalidFilterParams, applyPngPredictor(allocator, "abc", 0, 1, 8));
+    try std.testing.expectError(error.InvalidFilterParams, applyPngPredictor(allocator, "abc", 1, 1, 3));
+}
+
+test "FlateDecode enforces output limit while streaming" {
+    const compressed = [_]u8{
+        0x78, 0x9c, 0xed, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0x6c, 0xeb, 0x5f, 0xca, 0x1a,
+        0x1e, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaf,
+        0x06, 0xe2, 0x0c, 0x34, 0x6e,
+    };
+    try std.testing.expectError(
+        error.OutputTooLarge,
+        decodeFlateDecodeWithLimit(std.testing.allocator, &compressed, null, 1_000),
+    );
 }

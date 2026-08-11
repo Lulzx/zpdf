@@ -2,23 +2,17 @@ const std = @import("std");
 const compat = @import("src/compat.zig");
 const testpdf = @import("src/testpdf.zig");
 
-pub fn main() !void {
-    var gpa = compat.generalPurposeAllocator();
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub const main = compat.MainWithArgs(mainInner).main;
 
-    // Zig 0.16 file I/O requires an Io implementation. Keep this local to the
-    // standalone generator instead of adopting the richer process.Init entrypoint.
-    var threaded: if (@hasDecl(std.process, "Init")) std.Io.Threaded else void = if (@hasDecl(std.process, "Init")) .init(allocator, .{}) else {};
-    defer if (@hasDecl(std.process, "Init")) threaded.deinit();
-    if (@hasDecl(std.process, "Init")) compat.setIo(threaded.io());
+fn mainInner(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const output_path = if (args.len > 1) args[1] else "test.pdf";
 
     const pdf_data = try testpdf.generateMinimalPdf(allocator, "Hello from zpdf!");
     defer allocator.free(pdf_data);
 
-    const file = try compat.createFileCwd("test.pdf");
+    const file = try compat.createFileCwd(output_path);
     defer compat.closeFile(file);
     try compat.writeAllFile(file, pdf_data);
 
-    std.debug.print("Generated test.pdf ({} bytes)\n", .{pdf_data.len});
+    std.debug.print("Generated {s} ({} bytes)\n", .{ output_path, pdf_data.len });
 }
