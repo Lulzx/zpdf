@@ -7,7 +7,7 @@ name = "zpdf"
 version = "0.1.0"
 description = "High-performance PDF text extraction powered by Zig"
 readme = "README.md"
-license = "CC0-1.0"
+license = { text = "CC0-1.0" }
 requires-python = ">=3.8"
 dependencies = ["cffi>=1.15"]
 authors = [{name = "Lulzx"}]
