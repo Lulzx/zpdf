@@ -25,14 +25,12 @@ git clone https://github.com/veraPDF/veraPDF-corpus.git verapdf
 python3 verapdf_bench.py
 ```
 
-### Expected Results
+### Reporting Results
 
-On Apple M4 Pro:
-
-| Tool | Time | PDFs/sec | Speedup |
-|------|------|----------|---------|
-| zpdf | ~6s | ~487 | ~5.7x |
-| MuPDF | ~34s | ~85 | 1x |
+Results depend on the repository revision, Zig and MuPDF versions, hardware,
+corpus revision, cache state, and run policy. Record those details alongside
+the raw command output instead of treating a previous machine's measurements
+as expected performance.
 
 ## Accuracy Benchmark
 

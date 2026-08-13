@@ -11,21 +11,22 @@ A PDF text extraction library written in Zig.
 - XRef table and stream parsing (PDF 1.5+)
 - Configurable error handling (strict or permissive)
 - Structure tree extraction for tagged PDFs (PDF/UA)
-- Geometric (Y→X) reading order for non-tagged PDFs
+- Optional geometric reading order for non-tagged PDFs
 - Markdown export for structured PDFs
 
-## Benchmark
+## Benchmarking
 
-Text extraction performance on Apple M4 Pro (reading order):
+Build with `zig build -Doptimize=ReleaseFast`, then run:
 
-| Document | Pages | zpdf | MuPDF | Speedup |
-|----------|------:|-----:|------:|--------:|
-| [Intel SDM](https://cdrdv2.intel.com/v1/dl/getContent/671200) | 5,252 | **582ms** | 2,152ms | 3.7x |
-| [Pandas Docs](https://pandas.pydata.org/pandas-docs/version/1.4/pandas.pdf) | 3,743 | **640ms** | 1,130ms | 1.8x |
-| [C++ Standard](https://open-std.org/jtc1/sc22/wg21/docs/papers/2023/n4950.pdf) | 2,134 | **438ms** | 1,007ms | 2.3x |
-| [PDF Reference 1.7](https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/pdfreference1.7old.pdf) | 1,310 | **236ms** | 1,481ms | 6.3x |
+```bash
+zig build bench -- document.pdf
+```
 
-*Build with `zig build -Doptimize=ReleaseFast` for best performance.*
+This runs five zpdf extractions and, when `mutool` is installed, one MuPDF
+comparison. Treat the result as a local diagnostic rather than a controlled
+cross-tool benchmark: record the zpdf revision, Zig and MuPDF versions,
+hardware, input checksum, and run policy when publishing results. Additional
+corpus and accuracy tools are documented in [`benchmark/README.md`](benchmark/README.md).
 
 ## Requirements
 
@@ -86,7 +87,7 @@ with zpdf.Document("file.pdf") as doc:
     # Single page
     text = doc.extract_page(0)
 
-    # All pages (accuracy mode is default)
+    # All pages (structure-tree order when available; otherwise stream order)
     all_text = doc.extract_all()
 
     # Fast mode (higher throughput, stream-order extraction)
@@ -144,19 +145,26 @@ examples/            # Usage examples
 
 ## Reading Order
 
-zpdf extracts text in logical reading order using a three-tier approach:
+The default extraction path prioritizes complete text extraction:
 
-1. **Structure Tree** (preferred): Uses the PDF's semantic structure for tagged/accessible PDFs (PDF/UA). Correctly handles multi-column layouts, sidebars, tables, and captions.
+1. **Structure Tree** (preferred): For tagged PDFs, uses marked-content IDs in
+   the document's semantic structure. If the structured result contains too
+   little of the page's stream text, zpdf keeps the more complete stream-order
+   result instead.
 
-2. **Geometric Sort** (fallback): When no structure tree exists, sorts text spans by Y→X position to approximate visual reading order.
+2. **Stream Order** (default fallback): Untagged content is extracted in raw PDF
+   content-stream order. Python `extract_all(mode="fast")` uses the same order
+   while bypassing structure-tree processing.
 
-3. **Stream Order** (last resort): When bounding box extraction fails, falls back to raw PDF content stream order.
+3. **Geometric Layout** (opt-in): `zpdf extract --reading-order` and Python
+   `extract_page(..., reading_order=True)` analyze estimated span positions and
+   columns to approximate visual order. This path is experimental.
 
 | Method | Pros | Cons |
 |--------|------|------|
-| Structure tree | Correct semantic order, handles complex layouts | Only works on tagged PDFs |
-| Geometric sort | Works on any PDF, respects visual layout | May fail on complex multi-column layouts |
-| Stream order | Always works | May not match visual order |
+| Structure tree | Uses author-provided semantic order | Requires usable tagging and may be incomplete |
+| Stream order | Fast and preserves content completeness | May not match visual order |
+| Geometric layout | Can approximate visual and column order | Uses estimated bounds and may fail on complex layouts |
 
 ## Comparison
 
@@ -164,9 +172,9 @@ zpdf extracts text in logical reading order using a three-tier approach:
 |---------|------|--------|-------|
 | **Text Extraction** | | | |
 | Stream order | Yes | Yes | Yes |
-| Tagged/structure tree | Yes | No | Yes |
-| Visual reading order | No | No | Yes |
-| Word bounding boxes | Yes | Yes | Yes |
+| Tagged/structure tree API | Yes | Yes | Yes |
+| Visual reading order | Experimental | No | Yes |
+| Text-span bounds | Estimated | Yes | Yes |
 | **Font Support** | | | |
 | WinAnsi/MacRoman | Yes | Yes | Yes |
 | ToUnicode CMap | Yes | Yes | Yes |
@@ -179,6 +187,10 @@ zpdf extracts text in logical reading order using a three-tier approach:
 | Rendering | No | Yes | Yes |
 
 *\*CID fonts: Works when CMap is embedded directly.*
+
+zpdf's span bounds use text positions plus an estimated width; they are not
+exact glyph or word bounds. Competitor capabilities refer to their public APIs
+and may vary by version.
 
 **Use zpdf when:** Batch processing, tagged PDFs (PDF/UA), simple text extraction, Zig integration.
 
