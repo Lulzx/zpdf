@@ -89,6 +89,18 @@ pub const StructTree = struct {
 
 const MAX_STRUCT_DEPTH: u32 = 256;
 
+const StructParseContext = struct {
+    active_refs: std.AutoHashMap(u32, void),
+
+    fn init(allocator: std.mem.Allocator) StructParseContext {
+        return .{ .active_refs = std.AutoHashMap(u32, void).init(allocator) };
+    }
+
+    fn deinit(self: *StructParseContext) void {
+        self.active_refs.deinit();
+    }
+};
+
 fn collectMcidsInOrder(
     elem: *const StructElement,
     result: *std.AutoHashMap(usize, std.ArrayList(MarkedContentRef)),
@@ -173,8 +185,11 @@ pub fn parseStructTree(
         elements.deinit(allocator);
     }
 
+    var context = StructParseContext.init(allocator);
+    defer context.deinit();
+
     const root_kids = struct_tree_dict.get("K") orelse return emptyTree(allocator);
-    const root_elem = try parseStructElement(allocator, data, xref, cache, root_kids, &elements);
+    const root_elem = try parseStructElement(allocator, data, xref, cache, root_kids, &elements, &context, 0);
 
     const elements_slice = try elements.toOwnedSlice(allocator);
 
@@ -200,7 +215,23 @@ fn parseStructElement(
     cache: *std.AutoHashMap(u32, Object),
     obj: Object,
     elements: *std.ArrayList(*StructElement),
+    context: *StructParseContext,
+    depth: u32,
 ) !?*const StructElement {
+    if (depth >= MAX_STRUCT_DEPTH) return error.StructureTreeTooDeep;
+
+    const ref_num: ?u32 = switch (obj) {
+        .reference => |r| r.num,
+        else => null,
+    };
+    if (ref_num) |num| {
+        const entry = try context.active_refs.getOrPut(num);
+        if (entry.found_existing) return null;
+    }
+    defer {
+        if (ref_num) |num| _ = context.active_refs.remove(num);
+    }
+
     // Resolve if reference
     const resolved = switch (obj) {
         .reference => |r| pagetree.resolveRef(allocator, data, xref, r, cache) catch return null,
@@ -231,7 +262,7 @@ fn parseStructElement(
             errdefer children.deinit(allocator);
 
             if (dict.get("K")) |kids| {
-                try parseKids(allocator, data, xref, cache, kids, &children, elements, page_ref);
+                try parseKids(allocator, data, xref, cache, kids, &children, elements, page_ref, context, depth + 1);
             }
 
             const children_slice = try children.toOwnedSlice(allocator);
@@ -270,15 +301,20 @@ fn parseKids(
     children: *std.ArrayList(StructChild),
     elements: *std.ArrayList(*StructElement),
     parent_page: ?ObjRef,
+    context: *StructParseContext,
+    depth: u32,
 ) !void {
+    if (depth >= MAX_STRUCT_DEPTH) return error.StructureTreeTooDeep;
+
     switch (kids_obj) {
         .array => |arr| {
             for (arr) |item| {
-                try parseKids(allocator, data, xref, cache, item, children, elements, parent_page);
+                try parseKids(allocator, data, xref, cache, item, children, elements, parent_page, context, depth + 1);
             }
         },
         .integer => |mcid| {
             // Direct MCID
+            if (mcid < std.math.minInt(i32) or mcid > std.math.maxInt(i32)) return;
             try children.append(allocator, .{
                 .mcid = .{
                     .mcid = @intCast(mcid),
@@ -289,14 +325,18 @@ fn parseKids(
         },
         .reference => |ref| {
             // Could be another StructElem or MCR
+            const entry = try context.active_refs.getOrPut(ref.num);
+            if (entry.found_existing) return;
+            defer _ = context.active_refs.remove(ref.num);
             const resolved = pagetree.resolveRef(allocator, data, xref, ref, cache) catch return;
-            try parseKids(allocator, data, xref, cache, resolved, children, elements, parent_page);
+            try parseKids(allocator, data, xref, cache, resolved, children, elements, parent_page, context, depth + 1);
         },
         .dict => |dict| {
             // Check if it's an MCR (Marked Content Reference)
             const type_name = dict.getName("Type");
             if (type_name != null and std.mem.eql(u8, type_name.?, "MCR")) {
                 const mcid = dict.getInt("MCID") orelse return;
+                if (mcid < std.math.minInt(i32) or mcid > std.math.maxInt(i32)) return;
                 const pg = switch (dict.get("Pg") orelse Object{ .null = {} }) {
                     .reference => |r| r,
                     else => parent_page,
@@ -327,7 +367,7 @@ fn parseKids(
                 errdefer sub_children.deinit(allocator);
 
                 if (dict.get("K")) |sub_kids| {
-                    try parseKids(allocator, data, xref, cache, sub_kids, &sub_children, elements, page_ref);
+                    try parseKids(allocator, data, xref, cache, sub_kids, &sub_children, elements, page_ref, context, depth + 1);
                 }
 
                 const sub_children_slice = try sub_children.toOwnedSlice(allocator);
@@ -448,3 +488,51 @@ pub const MarkedContentExtractor = struct {
         return null;
     }
 };
+
+test "structure parser rejects excessive nesting" {
+    const allocator = std.testing.allocator;
+    var xref = XRefTable.init(allocator);
+    defer xref.deinit();
+    var cache = std.AutoHashMap(u32, Object).init(allocator);
+    defer cache.deinit();
+    var context = StructParseContext.init(allocator);
+    defer context.deinit();
+    var elements: std.ArrayList(*StructElement) = .empty;
+    defer elements.deinit(allocator);
+    var children: std.ArrayList(StructChild) = .empty;
+    defer children.deinit(allocator);
+
+    try std.testing.expectError(
+        error.StructureTreeTooDeep,
+        parseKids(allocator, "", &xref, &cache, Object{ .array = &.{} }, &children, &elements, null, &context, MAX_STRUCT_DEPTH),
+    );
+}
+
+test "structure parser stops reference cycles" {
+    const allocator = std.testing.allocator;
+    var xref = XRefTable.init(allocator);
+    defer xref.deinit();
+    var cache = std.AutoHashMap(u32, Object).init(allocator);
+    defer cache.deinit();
+    try cache.put(7, Object{ .reference = .{ .num = 7, .gen = 0 } });
+    var context = StructParseContext.init(allocator);
+    defer context.deinit();
+    var elements: std.ArrayList(*StructElement) = .empty;
+    defer elements.deinit(allocator);
+    var children: std.ArrayList(StructChild) = .empty;
+    defer children.deinit(allocator);
+
+    try parseKids(
+        allocator,
+        "",
+        &xref,
+        &cache,
+        Object{ .reference = .{ .num = 7, .gen = 0 } },
+        &children,
+        &elements,
+        null,
+        &context,
+        0,
+    );
+    try std.testing.expectEqual(@as(usize, 0), children.items.len);
+}

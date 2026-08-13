@@ -113,6 +113,7 @@ export fn zpdf_extract_all(handle: i32, out_len: *usize) ?[*]u8 {
     if (documents[idx]) |doc| {
         const slice = doc.extractAllTextStructured(wasm_allocator) catch return null;
         if (slice.len == 0) {
+            wasm_allocator.free(slice);
             out_len.* = 0;
             return null;
         }
@@ -130,6 +131,7 @@ export fn zpdf_extract_all_fast(handle: i32, out_len: *usize) ?[*]u8 {
     if (documents[idx]) |doc| {
         const slice = doc.extractAllTextFast(wasm_allocator) catch return null;
         if (slice.len == 0) {
+            wasm_allocator.free(slice);
             out_len.* = 0;
             return null;
         }
@@ -151,6 +153,7 @@ export fn zpdf_extract_all_markdown(handle: i32, out_len: *usize) ?[*]u8 {
 
         // extractAllMarkdown returns an allocated slice; treat zero-length as "no data"
         if (result.len == 0) {
+            wasm_allocator.free(result);
             out_len.* = 0;
             return null;
         }

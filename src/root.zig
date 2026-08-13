@@ -258,7 +258,7 @@ pub const Document = struct {
             if (!self.error_config.continue_on_parse_error) {
                 return error.InvalidPdfHeader;
             }
-            try self.errors.append(self.allocator, .{
+            try self.recordError(.{
                 .kind = .invalid_header,
                 .offset = 0,
                 .message = "Invalid PDF header",
@@ -268,7 +268,7 @@ pub const Document = struct {
         // Parse XRef (HashMap uses base allocator, parsed objects use arena)
         self.xref_table = xref.parseXRef(self.allocator, arena, self.data) catch |err| {
             if (self.error_config.continue_on_parse_error) {
-                try self.errors.append(self.allocator, .{
+                try self.recordError(.{
                     .kind = .invalid_xref,
                     .offset = 0,
                     .message = "Failed to parse XRef table",
@@ -284,7 +284,7 @@ pub const Document = struct {
             if (!self.error_config.continue_on_parse_error) {
                 return error.EncryptedPdf;
             }
-            try self.errors.append(self.allocator, .{
+            try self.recordError(.{
                 .kind = .encrypted,
                 .offset = 0,
                 .message = "PDF is encrypted; text extraction will produce incorrect results",
@@ -295,7 +295,7 @@ pub const Document = struct {
         // Build page tree (uses arena for all allocations)
         const pages_slice = pagetree.buildPageTree(arena, self.data, &self.xref_table) catch |err| {
             if (self.error_config.continue_on_parse_error) {
-                try self.errors.append(self.allocator, .{
+                try self.recordError(.{
                     .kind = .syntax_error,
                     .offset = 0,
                     .message = "Failed to build page tree",
@@ -312,16 +312,34 @@ pub const Document = struct {
         }
     }
 
+    fn recordError(self: *Document, record: ParseErrorRecord) !void {
+        if (self.errors.items.len >= self.error_config.max_errors) {
+            return error.ErrorLimitExceeded;
+        }
+        try self.errors.append(self.allocator, record);
+        if (comptime !is_wasm) {
+            if (!self.error_config.log_errors) return;
+            std.debug.print("zpdf: {s} at offset {}\n", .{ record.message, record.offset });
+        }
+    }
+
     /// Lazy-load fonts for a specific page (called on first extraction)
-    fn ensurePageFonts(self: *Document, page_idx: usize) void {
+    fn ensurePageFonts(self: *Document, page_idx: usize) !void {
         const arena = self.parsing_arena.allocator();
         const page = self.pages.items[page_idx];
         if (page.resources == null) return;
         const resources = page.resources.?;
         const fonts_dict_obj = resources.get("Font") orelse return;
 
-        const fonts_dict_resolved = switch (fonts_dict_obj) {
-            .reference => |ref| pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch null,
+        const fonts_dict_resolved: ?Object = switch (fonts_dict_obj) {
+            .reference => |ref| blk: {
+                const resolved = pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch |err| {
+                    if (!self.error_config.continue_on_missing_object) return err;
+                    return;
+                };
+                if (resolved == .null and !self.error_config.continue_on_missing_object) return error.MissingObject;
+                break :blk resolved;
+            },
             else => fonts_dict_obj,
         };
 
@@ -355,7 +373,14 @@ pub const Document = struct {
 
             // Resolve font dictionary
             const font_obj = switch (entry.value) {
-                .reference => |ref| pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch continue,
+                .reference => |ref| blk: {
+                    const resolved = pagetree.resolveRef(arena, self.data, &self.xref_table, ref, &self.object_cache) catch |err| {
+                        if (!self.error_config.continue_on_missing_object) return err;
+                        continue;
+                    };
+                    if (resolved == .null and !self.error_config.continue_on_missing_object) return error.MissingObject;
+                    break :blk resolved;
+                },
                 .dict => entry.value,
                 else => continue,
             };
@@ -391,7 +416,10 @@ pub const Document = struct {
                     const r: *const Resolver = @ptrCast(@alignCast(ctx));
                     return r.resolve(obj);
                 }
-            }.wrapper, &resolver) catch continue;
+            }.wrapper, &resolver) catch |err| {
+                if (!self.error_config.continue_on_encoding_error) return err;
+                continue;
+            };
 
             // Need to dupe key since bufPrint uses stack buffer
             const owned_key = arena.dupe(u8, key) catch continue;
@@ -462,13 +490,15 @@ pub const Document = struct {
 
     /// Resolve an object reference
     pub fn resolve(self: *Document, ref: ObjRef) !Object {
-        return pagetree.resolveRef(
+        const obj = try pagetree.resolveRef(
             self.parsing_arena.allocator(),
             self.data,
             &self.xref_table,
             ref,
             &self.object_cache,
         );
+        if (obj == .null and !self.error_config.continue_on_missing_object) return error.MissingObject;
+        return obj;
     }
 
     /// Extract text from a page, streaming directly to writer
@@ -491,7 +521,7 @@ pub const Document = struct {
             &self.object_cache,
         ) catch |err| {
             if (self.error_config.continue_on_parse_error) {
-                try self.errors.append(self.allocator, .{
+                try self.recordError(.{
                     .kind = .invalid_stream,
                     .offset = 0,
                     .message = "Failed to get page contents",
@@ -505,7 +535,7 @@ pub const Document = struct {
         if (content.len == 0) return;
 
         // Lazy-load fonts for this page
-        self.ensurePageFonts(page_num);
+        try self.ensurePageFonts(page_num);
 
         // Extract text with full Form XObject support
         const ctx = ExtractionContext{
@@ -551,7 +581,7 @@ pub const Document = struct {
         if (content.len == 0) return &.{};
 
         // Lazy-load fonts for this page (needed for proper text decoding)
-        self.ensurePageFonts(page_num);
+        try self.ensurePageFonts(page_num);
 
         var collector = interpreter.SpanCollector.init(allocator);
         errdefer collector.deinit();
@@ -671,7 +701,7 @@ pub const Document = struct {
         if (content.len == 0) return allocator.alloc(u8, 0);
 
         // Lazy-load fonts for this page
-        self.ensurePageFonts(page_num);
+        try self.ensurePageFonts(page_num);
 
         // Check if we have cached reading order for this page
         if (self.cached_reading_order) |*cache| {
@@ -768,7 +798,7 @@ pub const Document = struct {
         const page = self.pages.items[page_num];
         const content = pagetree.getPageContents(parse_allocator, scratch_allocator, self.data, &self.xref_table, page, &self.object_cache) catch return output.toOwnedSlice(allocator);
 
-        self.ensurePageFonts(page_num);
+        try self.ensurePageFonts(page_num);
         try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, compat.arrayListWriter(&output, allocator));
         return output.toOwnedSlice(allocator);
     }
@@ -792,7 +822,7 @@ pub const Document = struct {
         // Pre-load all fonts for smaller docs to reduce per-page overhead.
         if (num_pages <= 100) {
             for (0..num_pages) |i| {
-                self.ensurePageFonts(i);
+                try self.ensurePageFonts(i);
             }
         }
 
@@ -825,7 +855,7 @@ pub const Document = struct {
         // Pre-load fonts for smaller docs to reduce per-page overhead.
         if (num_pages <= 100) {
             for (0..num_pages) |i| {
-                self.ensurePageFonts(i);
+                try self.ensurePageFonts(i);
             }
         }
 
@@ -853,7 +883,7 @@ pub const Document = struct {
                 ) catch continue;
 
                 if (content.len == 0) continue;
-                self.ensurePageFonts(page_num);
+                try self.ensurePageFonts(page_num);
                 try extractTextFromContent(scratch_allocator, content, page_num, &self.font_cache, compat.arrayListWriter(&result, allocator));
             }
         }
@@ -1574,8 +1604,12 @@ pub const Document = struct {
         const subtype = xobj_stream.dict.getName("Subtype") orelse return null;
         if (!std.mem.eql(u8, subtype, "Image")) return null;
 
-        const width: u32 = if (xobj_stream.dict.getInt("Width")) |w| @intCast(w) else return null;
-        const height: u32 = if (xobj_stream.dict.getInt("Height")) |h| @intCast(h) else return null;
+        const width_value = xobj_stream.dict.getInt("Width") orelse return null;
+        const height_value = xobj_stream.dict.getInt("Height") orelse return null;
+        if (width_value < 0 or width_value > std.math.maxInt(u32) or
+            height_value < 0 or height_value > std.math.maxInt(u32)) return null;
+        const width: u32 = @intCast(width_value);
+        const height: u32 = @intCast(height_value);
 
         return .{ .width = width, .height = height };
     }
@@ -2496,6 +2530,17 @@ test "ErrorConfig presets" {
 
     const permissive = ErrorConfig.permissive();
     try std.testing.expect(permissive.continue_on_parse_error);
+}
+
+test "ErrorConfig max_errors is enforced" {
+    const config = ErrorConfig{
+        .max_errors = 0,
+        .continue_on_parse_error = true,
+    };
+    try std.testing.expectError(
+        error.ErrorLimitExceeded,
+        Document.openFromMemoryUnsafe(std.testing.allocator, "not a pdf", config),
+    );
 }
 
 test "allocated memory path cleanup" {
