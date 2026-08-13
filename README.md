@@ -27,6 +27,11 @@ comparison. Treat the result as a local diagnostic rather than a controlled
 cross-tool benchmark: record the zpdf revision, Zig and MuPDF versions,
 hardware, input checksum, and run policy when publishing results. Additional
 corpus and accuracy tools are documented in [`benchmark/README.md`](benchmark/README.md).
+The full methodology uses
+[olmOCR-Bench, veraPDF, and PDF.js corpora](docs/benchmark-corpora.md) to keep
+ground-truth accuracy separate from compatibility and robustness. Initial
+[measured findings](docs/benchmark-findings.md) identify concrete reading-order
+and dense-text gaps.
 
 ## Requirements
 

@@ -1,0 +1,18 @@
+{
+  "olmocr_code": {
+    "url": "https://github.com/allenai/olmocr.git",
+    "revision": "f7cfe4c22098b154c76b6ec950d1c0a464eecf8d"
+  },
+  "olmocr_bench": {
+    "url": "https://huggingface.co/datasets/allenai/olmOCR-bench",
+    "revision": "54a96a6fb6a2bd3b297e59869491db4d3625b711"
+  },
+  "verapdf": {
+    "url": "https://github.com/veraPDF/veraPDF-corpus.git",
+    "revision": "49de56cd987929932c9e4fbbbe67d052bf44ef83"
+  },
+  "pdfjs": {
+    "url": "https://github.com/mozilla/pdf.js.git",
+    "revision": "5903d58d58e4dd9ce6ffa3834aea8480f06b4ada"
+  }
+}

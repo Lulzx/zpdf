@@ -23,5 +23,9 @@ python/dist/
 test/
 *.pdf
 
+# Downloaded benchmark corpora and generated reports
+benchmark/corpora/
+benchmark/results/
+
 # WASM binary (built by CI)
 web/zpdf.wasm
