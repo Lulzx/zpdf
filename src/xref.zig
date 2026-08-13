@@ -60,8 +60,12 @@ pub const XRefParseError = error{
     InvalidXrefStream,
     InvalidTrailer,
     UnsupportedXrefFormat,
+    CircularXrefChain,
+    TooManyXrefSections,
     OutOfMemory,
 };
+
+const MAX_XREF_SECTIONS: usize = 1024;
 
 /// Parse XRef from PDF data, starting from EOF
 /// hash_allocator: used for XRefTable.entries HashMap
@@ -73,10 +77,19 @@ pub fn parseXRef(hash_allocator: std.mem.Allocator, parse_allocator: std.mem.All
     var xref = XRefTable.init(hash_allocator);
     errdefer xref.deinit();
 
+    var visited_offsets = std.AutoHashMap(u64, void).init(hash_allocator);
+    defer visited_offsets.deinit();
+    var section_count: usize = 0;
+
     // Parse XRef chain (following /Prev links for incremental updates)
     var current_offset: ?u64 = startxref_offset;
 
     while (current_offset) |offset| {
+        if (section_count >= MAX_XREF_SECTIONS) return XRefParseError.TooManyXrefSections;
+        section_count += 1;
+        const visited = visited_offsets.getOrPut(offset) catch return XRefParseError.OutOfMemory;
+        if (visited.found_existing) return XRefParseError.CircularXrefChain;
+
         if (offset >= data.len) return XRefParseError.InvalidXrefOffset;
 
         const xref_start = data[@intCast(offset)..];
@@ -132,7 +145,8 @@ fn findStartXref(data: []const u8) ?u64 {
     // Parse offset
     var offset: u64 = 0;
     while (pos < search_region.len and search_region[pos] >= '0' and search_region[pos] <= '9') {
-        offset = offset * 10 + (search_region[pos] - '0');
+        offset = std.math.mul(u64, offset, 10) catch return null;
+        offset = std.math.add(u64, offset, search_region[pos] - '0') catch return null;
         pos += 1;
     }
 
@@ -220,7 +234,11 @@ fn parseXrefTable(
                 pos += 1;
             }
 
-            const obj_num: u32 = @intCast(first_obj + i);
+            const obj_num_u64 = std.math.add(u64, first_obj, i) catch return XRefParseError.InvalidXrefTable;
+            if (obj_num_u64 > std.math.maxInt(u32) or gen > std.math.maxInt(u16)) {
+                return XRefParseError.InvalidXrefTable;
+            }
+            const obj_num: u32 = @intCast(obj_num_u64);
 
             // Only add if not already present (first occurrence wins for incremental updates)
             if (!xref.entries.contains(obj_num)) {
@@ -275,7 +293,11 @@ fn parseXrefStream(
         else => 0,
     };
 
-    const entry_size = w0 + w1 + w2;
+    if (w0 > @sizeOf(u64) or w1 > @sizeOf(u64) or w2 > @sizeOf(u64)) {
+        return XRefParseError.InvalidXrefStream;
+    }
+    const entry_size = std.math.add(usize, std.math.add(usize, w0, w1) catch return XRefParseError.InvalidXrefStream, w2) catch
+        return XRefParseError.InvalidXrefStream;
     if (entry_size == 0) return XRefParseError.InvalidXrefStream;
 
     // Decompress stream data (arena-allocated, no need to free)
@@ -321,9 +343,9 @@ fn parseXrefStream(
 
         while (count > 0) : ({
             count -= 1;
-            obj_num += 1;
+            obj_num = std.math.add(u64, obj_num, 1) catch return XRefParseError.InvalidXrefStream;
         }) {
-            if (data_pos + entry_size > decoded.len) break;
+            if (entry_size > decoded.len -| data_pos) break;
 
             // Read type field (default 1 if w0 == 0)
             const entry_type_val: u64 = if (w0 > 0)
@@ -348,22 +370,23 @@ fn parseXrefStream(
             const entry: XRefEntry = switch (entry_type_val) {
                 0 => .{
                     .offset = field2, // Next free object
-                    .gen_or_index = @intCast(field3), // Gen if reused
+                    .gen_or_index = if (field3 <= std.math.maxInt(u16)) @intCast(field3) else return XRefParseError.InvalidXrefStream,
                     .entry_type = .free,
                 },
                 1 => .{
                     .offset = field2, // Byte offset
-                    .gen_or_index = @intCast(field3), // Generation
+                    .gen_or_index = if (field3 <= std.math.maxInt(u16)) @intCast(field3) else return XRefParseError.InvalidXrefStream,
                     .entry_type = .in_use,
                 },
                 2 => .{
                     .offset = field2, // Object stream number
-                    .gen_or_index = @intCast(field3), // Index within stream
+                    .gen_or_index = if (field3 <= std.math.maxInt(u16)) @intCast(field3) else return XRefParseError.InvalidXrefStream,
                     .entry_type = .compressed,
                 },
                 else => continue,
             };
 
+            if (obj_num > std.math.maxInt(u32)) return XRefParseError.InvalidXrefStream;
             const num: u32 = @intCast(obj_num);
             if (!xref.entries.contains(num)) {
                 xref.entries.put(num, entry) catch return XRefParseError.OutOfMemory;
@@ -385,7 +408,8 @@ fn parseUint(data: []const u8, pos: *usize) ?u64 {
     var found = false;
 
     while (pos.* < data.len and data[pos.*] >= '0' and data[pos.*] <= '9') {
-        value = value * 10 + (data[pos.*] - '0');
+        value = std.math.mul(u64, value, 10) catch return null;
+        value = std.math.add(u64, value, data[pos.*] - '0') catch return null;
         pos.* += 1;
         found = true;
     }
@@ -460,4 +484,30 @@ test "find startxref" {
     const data = "lots of content here\nstartxref\n12345\n%%EOF";
     const offset = findStartXref(data);
     try std.testing.expectEqual(@as(u64, 12345), offset.?);
+}
+
+test "oversized startxref is rejected without overflowing" {
+    const data = "startxref\n999999999999999999999999999999999999999\n%%EOF";
+    try std.testing.expect(findStartXref(data) == null);
+}
+
+test "circular Prev chain is rejected" {
+    const pdf_data =
+        \\%PDF-1.7
+        \\xref
+        \\0 1
+        \\0000000000 65535 f
+        \\trailer
+        \\<< /Size 1 /Prev 9 >>
+        \\startxref
+        \\9
+        \\%%EOF
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        XRefParseError.CircularXrefChain,
+        parseXRef(std.testing.allocator, arena.allocator(), pdf_data),
+    );
 }
