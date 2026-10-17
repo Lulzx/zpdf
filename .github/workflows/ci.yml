@@ -18,6 +18,7 @@ jobs:
         zig-version:
           - 0.15.2
           - 0.16.0
+          - 0.17.0
 
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +45,15 @@ jobs:
 
       - name: Build WebAssembly target
         run: zig build wasm
+
+      - name: Check build-step argument forwarding
+        run: |
+          mkdir -p test
+          zig run gen_test.zig -- test/test.pdf
+          zig build run -- extract test/test.pdf > "$RUNNER_TEMP/zpdf-text.txt"
+          grep -q 'Hello from zpdf!' "$RUNNER_TEMP/zpdf-text.txt"
+          zig build bench -- test/test.pdf --no-mutool > "$RUNNER_TEMP/zpdf-bench.txt" 2>&1
+          grep -q 'Throughput:' "$RUNNER_TEMP/zpdf-bench.txt"
 
   python:
     name: Python ${{ matrix.python-version }} bindings and wheel

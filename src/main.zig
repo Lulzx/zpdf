@@ -493,7 +493,7 @@ fn extractAllTextReadingOrderParallel(doc: *zpdf.Document, allocator: std.mem.Al
     }.run;
 
     // Spawn threads
-    var threads: [8]?Thread = [_]?Thread{null} ** 8;
+    var threads: [8]?Thread = @splat(null);
     const pages_per_thread = (num_pages + num_threads - 1) / num_threads;
 
     for (0..num_threads) |i| {

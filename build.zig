@@ -68,7 +68,9 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
+    if (comptime @hasDecl(std.Build.Step.Run, "addPassthruArgs")) {
+        run_cmd.addPassthruArgs();
+    } else if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
@@ -212,7 +214,9 @@ pub fn build(b: *std.Build) void {
     const bench_cmd = b.addRunArtifact(bench);
     bench_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
+    if (comptime @hasDecl(std.Build.Step.Run, "addPassthruArgs")) {
+        bench_cmd.addPassthruArgs();
+    } else if (b.args) |args| {
         bench_cmd.addArgs(args);
     }
 

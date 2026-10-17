@@ -12,7 +12,7 @@ var wasm_allocator = std.heap.wasm_allocator;
 
 // Document handle storage (simple slot-based system)
 const MAX_DOCUMENTS = 16;
-var documents: [MAX_DOCUMENTS]?*zpdf.Document = [_]?*zpdf.Document{null} ** MAX_DOCUMENTS;
+var documents: [MAX_DOCUMENTS]?*zpdf.Document = @splat(null);
 
 fn findFreeSlot() ?usize {
     for (documents, 0..) |doc, i| {

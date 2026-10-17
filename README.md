@@ -35,7 +35,7 @@ and dense-text gaps.
 
 ## Requirements
 
-- Zig 0.15.2 or later
+- Zig 0.15.2, 0.16.0, or 0.17.0
 
 ## Building
 
@@ -43,6 +43,9 @@ and dense-text gaps.
 zig build              # Build library and CLI
 zig build test         # Run tests
 ```
+
+On macOS 27 arm64, use Zig 0.16.0 or 0.17.0. Zig 0.15.2 cannot link its
+native build runner on that host.
 
 ## Usage
 
