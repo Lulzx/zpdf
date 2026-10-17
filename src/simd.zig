@@ -23,6 +23,12 @@ else
     @Vector(8, u8); // Fallback
 
 const vec_len = @typeInfo(Vec).vector.len;
+const Mask = switch (vec_len) {
+    8 => u8,
+    16 => u16,
+    32 => u32,
+    else => @compileError("unsupported SIMD vector length"),
+};
 
 // ============================================================================
 // WHITESPACE SKIPPING
@@ -61,7 +67,7 @@ pub fn skipWhitespace(data: []const u8, start: usize) usize {
             @as(@Vector(vec_len, bool), is_nul);
 
         // Find first non-whitespace
-        const mask = ~@as(std.meta.Int(.unsigned, vec_len), @bitCast(is_ws));
+        const mask = ~@as(Mask, @bitCast(is_ws));
         if (mask != 0) {
             return i + @ctz(mask);
         }
@@ -107,7 +113,7 @@ pub fn findDelimiter(data: []const u8, start: usize) ?usize {
         found = found | (chunk == ws_mask_lf);
         found = found | (chunk == ws_mask_cr);
 
-        const mask = @as(std.meta.Int(.unsigned, vec_len), @bitCast(found));
+        const mask = @as(Mask, @bitCast(found));
         if (mask != 0) {
             return i + @ctz(mask);
         }
@@ -145,7 +151,7 @@ pub fn findStreamKeyword(data: []const u8, start: usize) ?usize {
     while (i + vec_len <= data.len) {
         const chunk: Vec = data[i..][0..vec_len].*;
         const is_s = chunk == s_mask;
-        const mask = @as(std.meta.Int(.unsigned, vec_len), @bitCast(is_s));
+        const mask = @as(Mask, @bitCast(is_s));
 
         if (mask != 0) {
             // Found 's' - check if it's "stream"
@@ -184,7 +190,7 @@ pub fn findEndstreamKeyword(data: []const u8, start: usize) ?usize {
     while (i + vec_len <= data.len) {
         const chunk: Vec = data[i..][0..vec_len].*;
         const is_e = chunk == e_mask;
-        const mask = @as(std.meta.Int(.unsigned, vec_len), @bitCast(is_e));
+        const mask = @as(Mask, @bitCast(is_e));
 
         if (mask != 0) {
             var bit_pos: usize = 0;
@@ -333,7 +339,7 @@ pub fn findStringEnd(data: []const u8, start: usize) ?usize {
             @as(@Vector(vec_len, bool), is_close) |
             @as(@Vector(vec_len, bool), is_escape);
 
-        const mask = @as(std.meta.Int(.unsigned, vec_len), @bitCast(interesting));
+        const mask = @as(Mask, @bitCast(interesting));
 
         if (mask == 0) {
             // No interesting characters - skip entire chunk
@@ -381,7 +387,7 @@ pub fn findHexStringEnd(data: []const u8, start: usize) ?usize {
     while (i + vec_len <= data.len) {
         const chunk: Vec = data[i..][0..vec_len].*;
         const is_close = chunk == close_mask;
-        const mask = @as(std.meta.Int(.unsigned, vec_len), @bitCast(is_close));
+        const mask = @as(Mask, @bitCast(is_close));
 
         if (mask != 0) {
             return i + @ctz(mask);
@@ -416,7 +422,7 @@ pub fn findSubstring(data: []const u8, needle: []const u8) ?usize {
     while (i + vec_len <= data.len) {
         const chunk: Vec = data[i..][0..vec_len].*;
         const matches = chunk == first_mask;
-        var mask = @as(std.meta.Int(.unsigned, vec_len), @bitCast(matches));
+        var mask = @as(Mask, @bitCast(matches));
 
         while (mask != 0) {
             const offset = @ctz(mask);
@@ -480,6 +486,21 @@ test "skipWhitespace" {
     const result = skipWhitespace(data, 0);
     try std.testing.expectEqual(@as(usize, 8), result);
     try std.testing.expectEqual(@as(u8, 'h'), data[result]);
+}
+
+test "SIMD masks cover vector boundaries and scalar remainder" {
+    var data: [2 * vec_len + 1]u8 = @splat(' ');
+    try std.testing.expectEqual(data.len, skipWhitespace(&data, 0));
+    try std.testing.expectEqual(@as(?usize, null), findHexStringEnd(&data, 0));
+    try std.testing.expectEqual(@as(?usize, null), findSubstring(&data, ">"));
+
+    for ([_]usize{ 0, vec_len - 1, vec_len, data.len - 1 }) |pos| {
+        data[pos] = '>';
+        try std.testing.expectEqual(pos, skipWhitespace(&data, 0));
+        try std.testing.expectEqual(@as(?usize, pos), findHexStringEnd(&data, 0));
+        try std.testing.expectEqual(@as(?usize, pos), findSubstring(&data, ">"));
+        data[pos] = ' ';
+    }
 }
 
 test "skipWhitespace no whitespace" {
